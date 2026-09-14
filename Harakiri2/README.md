@@ -1,6 +1,6 @@
 
 <p align="center">
-    <img src="https://github.com/wildonion/elyon/blob/kagerou/src/HardLab/Harakiri2/harakiri.png">
+    <img src="https://github.com/wildonion/harakiri/blob/master/Harakiri2/harakiri.jpg">
 </p>
 
 # Harakiri — CUDA secp256k1 Puzzle Sweeper
