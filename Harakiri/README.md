@@ -555,7 +555,7 @@ result written to found.txt
 done
 ```
 
-> 41 bits key output on two 5090 RTX:
+> 41 bits key output on 2 RTX 5090 with 2 sections:
 
 ```
 ./harakiri_sweep.exe --batch 1024 --jobs 87040 --range 10000000000:1ffffffffff --target 1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E --maxbatch 200 --out found.txt --sections 2
@@ -601,6 +601,55 @@ PRIVATE KEY : 00000000000000000000000000000000000000000000000000000153869acc5b
 target      : d1562eb37357f9e6fc41cb2359f4d3eda4032329
 MATCH       : YES
 searched    : 7.289e+11 / 1.100e+12 keys (66.29% of range)
+result written to found.txt
+done
+```
+
+> 41 bits key output on a single 5090 RTX with 2 sections:
+
+```
+./harakiri_sweep.exe --batch 1024 --jobs 87040 --range 10000000000:1ffffffffff --target 1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E --maxbatch 200 --out found.txt --sections 2 --gpui 0
+
+=== Harakiri Phase 2 sweep ===
+range start : 0000000000000000000000000000000000000000000000000000010000000000
+batch size  : 1024
+selftest    : no
+backward    : no
+target      : d1562eb37357f9e6fc41cb2359f4d3eda4032329  (from address)
+CUDA driver/runtime: driver 13040, 2 device(s) visible
+  device 0: NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs, canMapHostMemory=1, unifiedAddressing=1)
+  device 1: NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs, canMapHostMemory=1, unifiedAddressing=1)
+GPU plan    : using device 0 only, 2 section(s).
+               To use more cards pass --sections <N> (>= device count)
+               and/or --gpui 0,1,...
+GPU 0       : NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs)
+config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 total threads | grid=340 blocks | sections=2 (groupSize=43520) | backward=no | max_batches=200 per launch | max_chunk=0000000000000000000000000000000000000000000000000000000000c0c400
+
+=== Harakiri Config Explained ===
+- batch            keys hashed per one field-inversion batch (B)
+- threads/block    block size (fixed 256, kernel launch bounds)
+- jobs             total worker threads = threads/block x grid blocks
+- grid             number of blocks = jobs / threads/block
+- sections         range split into N parallel slices; groupSize = jobs/N
+                   threads per slice (one slice per GPU on multi-GPU boxes)
+- backward         two-front race per section: a forward half from the
+                   section start + a backward half from the section end
+- max_batches      batches per thread per kernel launch (auto-timeboxed to ~10s; add --maxbatch to override)
+- max_chunk        keys each thread owns = range / jobs
+[GPU 0][dbg] FOUND at launch 40: threadId=40115 finder_batch=49
+
+=== results ===
+iterations : 41
+found on    : launch 40
+total keys : 715932751072
+sweep time : 79.468 s
+wall time  : 79.492 s (incl. warmup/table-gen)
+throughput : 9009.095 Mkeys/s
+FOUND scalar: 00000000000000000000000000000000000000000000000000000153869acc5b
+PRIVATE KEY : 00000000000000000000000000000000000000000000000000000153869acc5b
+target      : d1562eb37357f9e6fc41cb2359f4d3eda4032329
+MATCH       : YES
+searched    : 7.159e+11 / 1.100e+12 keys (65.11% of range)
 result written to found.txt
 done
 ```

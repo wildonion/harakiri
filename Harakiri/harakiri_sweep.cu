@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
+#include <algorithm>
 #include <chrono>
 #include <vector>
 #include <string>
@@ -118,20 +120,43 @@ static bool base58check_decode(const char* s, uint8_t out[20]) {
 }
 
 // ---- host helpers ----------------------------------------------------------
-static void hex_to_le256(const char* hex, uint64_t* out) {
-  // skip optional 0x prefix
+// Parses a hex string (optional 0x prefix, up to 64 digits) into 4 little-endian
+// 64-bit limbs. Returns false and leaves out[] untouched on any non-hex
+// character: the previous version computed `char - '0'` unconditionally, so a
+// stray '+' became -5 and shifted into a 64-bit register, silently producing a
+// nonsense 2^96-sized range instead of reporting a bad argument.
+static bool hex_to_le256(const char* hex, uint64_t* out) {
+  if (!hex) return false;
   if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex += 2;
-  // big-endian 64-hex-digit value -> 4 LE limbs
-  char buf[128];
-  int len = (int)strlen(hex);
-  for (int i = 0; i < len; i++) buf[len-1-i] = hex[i];
-  for (int i = 0; i < len; i++)
-    buf[i] = (buf[i] >= 'a') ? (char)(buf[i]-'a'+10) : (char)(buf[i]-'0');
-  for (int i = 0; i < 4; i++) {
-    uint64_t v = 0;
-    for (int j = 0; j < 16 && i*16+j < len; j++) v |= (uint64_t)buf[i*16+j] << (4*j);
-    out[i] = v;
+  size_t len = strlen(hex);
+  if (len == 0 || len > 64) return false;
+  int nib[64];
+  for (size_t i = 0; i < len; i++) {
+    char c = hex[i];
+    int v;
+    if      (c >= '0' && c <= '9') v = c - '0';
+    else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+    else return false;                       // reject '+', '-', spaces, junk
+    nib[len - 1 - i] = v;                   // big-endian digit order
   }
+  uint64_t limbs[4] = {0, 0, 0, 0};
+  for (int k = 0; k < 4; k++) {
+    uint64_t v = 0;
+    for (int j = 0; j < 16 && (size_t)(k * 16 + j) < len; j++)
+      v |= (uint64_t)nib[k * 16 + j] << (4 * j);
+    limbs[k] = v;
+  }
+  for (int k = 0; k < 4; k++) out[k] = limbs[k];
+  return true;
+}
+
+// Convert 4 little-endian 64-bit limbs to double. Saturates at +inf rather than
+// wrapping, so a bad range is visible instead of silently becoming a small number.
+static double le256_to_double(const uint64_t* in) {
+  double v = 0.0;
+  for (int i = 3; i >= 0; --i) v = v * 18446744073709551616.0 + (double)in[i];
+  return v;
 }
 
 static void le256_to_hex(const uint64_t* in, char* out) {
@@ -686,10 +711,7 @@ static void device_worker(WorkerCtx& W) {
       double el = std::chrono::duration<double>(now - t0).count();
       if (el > 0 && total_hashes > 0) {
         double rate = total_hashes / el;
-        double total_keys = (double)W.full_range_len[0]
-                          + (double)W.full_range_len[1] * 18446744073709551616.0
-                          + (double)W.full_range_len[2] * 340282366920938463463374607431768211456.0
-                          + (double)W.full_range_len[3] * 6277101735386680763835789423207666416102355444464034512896.0;
+        double total_keys = le256_to_double(W.full_range_len);
         double done = (total_hashes < total_keys) ? total_hashes : total_keys;
         double rem = total_keys - done;
         char ebuf[64];
@@ -745,6 +767,7 @@ int main(int argc, char** argv) {
   int warmup_sec = 0;     // --warmup N: run N s of GPU burn-in before the sweep
   int sections = 1;       // --sections N: split range into N parallel sections
   bool backward = false;  // --backward: two-front race (forward + backward halves per section)
+  std::vector<int> gpu_ids;  // --gpui 0,1,2: explicit device list; empty = 0..N-1
 
   // parse args
   for (int i = 1; i < argc; ++i) {
@@ -777,6 +800,32 @@ int main(int argc, char** argv) {
     else if (a == "--out" && i+1<argc) out_file = argv[++i];
     else if (a == "--warmup" && i+1<argc) warmup_sec = atoi(argv[++i]);
     else if (a == "--sections" && i+1<argc) sections = atoi(argv[++i]);
+    else if ((a == "--gpui" || a == "--devices") && i+1<argc) {
+      std::string list = argv[++i];
+      gpu_ids.clear();
+      size_t pos = 0;
+      while (pos <= list.size()) {
+        size_t comma = list.find(',', pos);
+        std::string tok = list.substr(pos, comma == std::string::npos
+                                            ? std::string::npos : comma - pos);
+        if (!tok.empty()) {
+          bool digits = true;
+          for (char c : tok) if (!isdigit((unsigned char)c)) { digits = false; break; }
+          if (!digits) {
+            fprintf(stderr, "error: --gpui wants comma-separated device ids, got '%s'\n",
+                    tok.c_str());
+            return 1;
+          }
+          gpu_ids.push_back(atoi(tok.c_str()));
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+      }
+      if (gpu_ids.empty()) {
+        fprintf(stderr, "error: --gpui given but no device ids parsed\n");
+        return 1;
+      }
+    }
     else if (a == "--backward") backward = true;
     else if (a == "--verbose") verbose = true;
     else if (a == "--selftest") self_test = true;
@@ -790,23 +839,84 @@ int main(int argc, char** argv) {
 
   size_t colon = range_hex.find(':');
   std::string start_hex = colon==std::string::npos ? range_hex : range_hex.substr(0, colon);
-  hex_to_le256(start_hex.c_str(), range_start);
+  if (!hex_to_le256(start_hex.c_str(), range_start)) {
+    fprintf(stderr, "error: invalid range start '%s' (want hex digits, optional 0x)\n",
+            start_hex.c_str());
+    return 1;
+  }
   bool range_is_infinite = (colon == std::string::npos);
   range_len[0]=range_len[1]=range_len[2]=range_len[3]=0;
   if (colon != std::string::npos) {
     std::string tail = range_hex.substr(colon+1);
-    // "start:len" (decimal length) vs "start:end" (hex, inclusive)
-    bool hex_end = (tail.size() >= 2 && tail[0]=='0' && (tail[1]=='x'||tail[1]=='X'));
-    if (!hex_end) { for (char c : tail) if (isxdigit((unsigned char)c) && !isdigit((unsigned char)c)) { hex_end=true; break; } }
-    if (hex_end) {
-      // end must be >= start; length = end - start + 1
-      uint64_t end[4]; hex_to_le256(tail.c_str(), end);
-      if (!ge256(end, range_start)) { fprintf(stderr, "error: end < start\n"); return 1; }
-      sub256(end, range_start, range_len);
-      add256_u64(range_len, 1);          // inclusive end
+    // Three explicit forms, decided by prefix rather than by sniffing for
+    // non-decimal hex digits (which misread a "+COUNT" as an end value):
+    //   START:+COUNT   count, decimal or 0x-prefixed hex
+    //   START:END      inclusive end bound, hex
+    //   START:COUNT    count, decimal (legacy, kept for compatibility)
+    if (!tail.empty() && tail[0] == '+') {
+      std::string cnt = tail.substr(1);
+      if (cnt.empty()) {
+        fprintf(stderr, "error: --range '%s' has '+' but no count\n", range_hex.c_str());
+        return 1;
+      }
+      bool hex_cnt = (cnt.size() > 2 && cnt[0]=='0' && (cnt[1]=='x'||cnt[1]=='X'));
+      if (hex_cnt) {
+        if (!hex_to_le256(cnt.c_str(), range_len)) {
+          fprintf(stderr, "error: invalid hex count '%s' in --range\n", cnt.c_str());
+          return 1;
+        }
+      } else {
+        for (char c : cnt)
+          if (!isdigit((unsigned char)c)) {
+            fprintf(stderr, "error: invalid count '%s' in --range (want decimal, or 0x hex)\n",
+                    cnt.c_str());
+            return 1;
+          }
+        errno = 0;
+        char* endp = nullptr;
+        unsigned long long v = strtoull(cnt.c_str(), &endp, 10);
+        if (errno != 0 || !endp || *endp != '\0') {
+          fprintf(stderr, "error: count '%s' in --range does not fit in 64 bits\n", cnt.c_str());
+          return 1;
+        }
+        range_len[0] = v;
+      }
+      if ((range_len[0]|range_len[1]|range_len[2]|range_len[3]) == 0) {
+        fprintf(stderr, "error: --range count must be > 0\n");
+        return 1;
+      }
     } else {
-      uint64_t len = strtoull(tail.c_str(), nullptr, 10);
-      range_len[0] = len;
+      // No '+': either an inclusive end bound or a legacy decimal length.
+      bool hex_end = (tail.size() >= 2 && tail[0]=='0' && (tail[1]=='x'||tail[1]=='X'));
+      if (!hex_end) { for (char c : tail) if (isxdigit((unsigned char)c) && !isdigit((unsigned char)c)) { hex_end=true; break; } }
+      if (hex_end) {
+        // end must be >= start; length = end - start + 1
+        uint64_t end[4];
+        if (!hex_to_le256(tail.c_str(), end)) {
+          fprintf(stderr, "error: invalid range end '%s' (want hex digits, optional 0x)\n",
+                  tail.c_str());
+          return 1;
+        }
+        if (!ge256(end, range_start)) { fprintf(stderr, "error: end < start\n"); return 1; }
+        sub256(end, range_start, range_len);
+        add256_u64(range_len, 1);          // inclusive end
+      } else {
+        for (char c : tail)
+          if (!isdigit((unsigned char)c)) {
+            fprintf(stderr, "error: invalid --range '%s'.\n"
+                    "       want START:END (hex), START:+COUNT (decimal or 0x hex), "
+                    "or START:COUNT (decimal)\n", range_hex.c_str());
+            return 1;
+          }
+        errno = 0;
+        char* endp = nullptr;
+        unsigned long long v = strtoull(tail.c_str(), &endp, 10);
+        if (errno != 0 || !endp || *endp != '\0') {
+          fprintf(stderr, "error: count '%s' in --range does not fit in 64 bits\n", tail.c_str());
+          return 1;
+        }
+        range_len[0] = v;
+      }
     }
   } else {
     // infinite range -> use 2^96 as "huge" cap
@@ -892,12 +1002,46 @@ int main(int argc, char** argv) {
 if (sections < 1) { fprintf(stderr, "--sections must be >= 1\n"); return 1; }
   if (sections > MAX_SECTIONS) { fprintf(stderr, "--sections too large (max %d)\n", MAX_SECTIONS); return 1; }
   if (backward && 2*sections > MAX_SECTIONS) { fprintf(stderr, "--backward doubles the grid: max --sections with --backward is %d\n", MAX_SECTIONS/2); return 1; }
-  if (self_test) sections = 1;   // selftest uses one section on device 0
 
-  int used_gpus = (ndev > 1 && sections > 1) ? ((sections < ndev) ? sections : ndev) : 1;
-  if (used_gpus > 1)
-    printf("GPU plan    : using %d of %d devices, %d section(s) spread across them\n",
-           used_gpus, ndev, sections);
+  // Device selection. Without --gpui the historical rule applies: devices
+  // 0..N-1 are used, but ONLY if sections > 1 (this is why the default
+  // --sections 1 leaves every card but the first idle).
+  std::vector<int> dev_ids;            // physical CUDA device per worker
+  if (!gpu_ids.empty()) {
+    for (size_t i = 0; i < gpu_ids.size(); ++i) {
+      if (gpu_ids[i] < 0 || gpu_ids[i] >= ndev) {
+        fprintf(stderr, "error: --gpui device %d is out of range (%d device(s) present)\n",
+                gpu_ids[i], ndev);
+        return 1;
+      }
+      if (std::find(dev_ids.begin(), dev_ids.end(), gpu_ids[i]) != dev_ids.end()) {
+        fprintf(stderr, "error: --gpui lists device %d more than once\n", gpu_ids[i]);
+        return 1;
+      }
+      dev_ids.push_back(gpu_ids[i]);
+    }
+    if (sections < (int)dev_ids.size()) {
+      fprintf(stderr, "error: --gpui selected %d device(s) but --sections is %d.\n"
+              "       sections must be >= the number of devices so each gets work.\n",
+              (int)dev_ids.size(), sections);
+      return 1;
+    }
+  } else {
+    int n = (ndev > 1 && sections > 1) ? ((sections < ndev) ? sections : ndev) : 1;
+    for (int i = 0; i < n; ++i) dev_ids.push_back(i);
+  }
+  int used_gpus = (int)dev_ids.size();
+  if (self_test) { sections = 1; dev_ids.assign(1, 0); used_gpus = 1; }
+  if (used_gpus > 1) {
+    printf("GPU plan    : using %d of %d device(s):", used_gpus, ndev);
+    for (int i = 0; i < used_gpus; ++i) printf(" %d", dev_ids[i]);
+    printf("  | %d section(s) spread across them\n", sections);
+  } else {
+    printf("GPU plan    : using device %d only, %d section(s).\n"
+           "               To use more cards pass --sections <N> (>= device count)\n"
+           "               and/or --gpui 0,1,...\n",
+           dev_ids.empty() ? 0 : dev_ids[0], sections);
+  }
 
   // ---- partition the range into N sections, assign round-robin to GPUs ----
   std::vector<SectionRange> all_sections;
@@ -905,7 +1049,7 @@ if (sections < 1) { fprintf(stderr, "--sections must be >= 1\n"); return 1; }
 
   std::vector<WorkerCtx> workers(used_gpus);
   for (int d = 0; d < used_gpus; ++d) {
-    workers[d].dev = d;
+    workers[d].dev = dev_ids[d];          // physical CUDA ordinal, not 0..N-1
     workers[d].B = B;
     workers[d].threads_per_block = threads_per_block;
     workers[d].threadsTotal = jobs_explicit ? threadsTotal : 0;
@@ -980,10 +1124,7 @@ workers[d].warmup_sec = warmup_sec;
   // ETA for the requested range at measured throughput. Only meaningful when the
   // range was exhausted WITHOUT a find: on a find the remaining keys are irrelevant.
   if (total_secs > 0 && !self_test && !range_is_infinite && !found) {
-    double total_keys = (double)range_len[0]
-                      + (double)range_len[1] * 18446744073709551616.0
-                      + (double)range_len[2] * 340282366920938463463374607431768211456.0
-                      + (double)range_len[3] * 6277101735386680763835789423207666416102355444464034512896.0;
+    double total_keys = le256_to_double(range_len);
     double done = (double)total_hashes;
     double rate = total_hashes / total_secs;
     double effective_done = (done < total_keys) ? done : total_keys;
@@ -991,11 +1132,19 @@ workers[d].warmup_sec = warmup_sec;
       double eta = (total_keys - effective_done) / rate;
       char buf[64];
       if (eta >= 86400.0*365.0)       sprintf(buf, "%.1f years", eta/(86400.0*365.0));
-      else if (eta >= 86400.0)        sprintf(buf, "%.1f days", eta/86400.0);
+      else if (eta >= 86400.0)        sprintf(buf, "%.1f days",  eta/86400.0);
       else if (eta >= 3600.0)         sprintf(buf, "%.1f hours", eta/3600.0);
-      else if (eta >= 60.0)           sprintf(buf, "%.1f min", eta/60.0);
-      else                            sprintf(buf, "%.1f s", eta);
-      printf("ETA        : %s (range %.3e keys, done %.3e)\n", buf, total_keys, done);
+      else if (eta >= 60.0)           sprintf(buf, "%.1f min",   eta/60.0);
+      else                            sprintf(buf, "%.1f s",     eta);
+      // A range above 2^64 keys is almost always a parse mistake, not intent.
+      // Say so instead of printing a confident "ETA 1037 years".
+      if (total_keys >= 1.8446744073709552e19) {
+        printf("range size : %.3e keys (>= 2^64 - this is almost certainly a parse error;\n"
+               "             expected START:END or START:+COUNT, and you can cross-check the\n"
+               "             range size against the 'range start' line above)\n", total_keys);
+      } else {
+        printf("ETA        : %s (range %.3e keys, done %.3e)\n", buf, total_keys, done);
+      }
     }
   }
 
@@ -1013,15 +1162,18 @@ workers[d].warmup_sec = warmup_sec;
       // GPUs stop draining once the global stop flag is set, so this is an
       // upper bound on the fraction actually swept.
       if (!range_is_infinite) {
-        double total_keys = (double)range_len[0]
-                          + (double)range_len[1] * 18446744073709551616.0
-                          + (double)range_len[2] * 340282366920938463463374607431768211456.0
-                          + (double)range_len[3] * 6277101735386680763835789423207666416102355444464034512896.0;
+        double total_keys = le256_to_double(range_len);
         double done = (double)total_hashes;
         if (total_keys > 0) {
           double pct = (done < total_keys ? done : total_keys) / total_keys * 100.0;
-          printf("searched    : %.3e / %.3e keys (%.2f%% of range)\n",
-                 done, total_keys, pct);
+          if (total_keys >= 1.8446744073709552e19) {
+            printf("searched    : %.3e keys over a range of %.3e keys\n"
+                   "              (range >= 2^64 - almost certainly a parse error)\n",
+                   done, total_keys);
+          } else {
+            printf("searched    : %.3e / %.3e keys (%.2f%% of range)\n",
+                   done, total_keys, pct);
+          }
         }
       }
     }
