@@ -558,7 +558,7 @@ done
 > 41 bits key output on 2 RTX 5090 with 2 sections:
 
 ```
-./harakiri_sweep.exe --batch 1024 --jobs 87040 --range 10000000000:1ffffffffff --target 1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E --maxbatch 200 --out found.txt --sections 2
+./harakiri_sweep.exe --batch 1024 --jobs 87040 --range 10000000000:1ffffffffff --target 1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E --maxbatch 200 --out found.txt --sections 2 --gpui 0,1
 
 === Harakiri Phase 2 sweep ===
 range start : 0000000000000000000000000000000000000000000000000000010000000000
@@ -569,7 +569,7 @@ target      : d1562eb37357f9e6fc41cb2359f4d3eda4032329  (from address)
 CUDA driver/runtime: driver 13040, 2 device(s) visible
   device 0: NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs, canMapHostMemory=1, unifiedAddressing=1)
   device 1: NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs, canMapHostMemory=1, unifiedAddressing=1)
-GPU plan    : using 2 of 2 devices, 2 section(s) spread across them
+GPU plan    : using 2 of 2 device(s): 0 1  | 2 section(s) spread across them
 GPU 0       : NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs)
 GPU 1       : NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs)
 config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 total threads | grid=340 blocks | sections=1 (groupSize=87040) | backward=no | max_batches=200 per launch | max_chunk=0000000000000000000000000000000000000000000000000000000000606400
@@ -592,15 +592,15 @@ config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 tot
 devices     : 2 GPUs
 iterations : 42
 found on    : launch 20
-total keys : 728864300352
-sweep time : 40.382 s
-wall time  : 40.496 s (incl. warmup/table-gen)
-throughput : 18049.066 Mkeys/s
+total keys : 732038548928
+sweep time : 40.851 s
+wall time  : 40.974 s (incl. warmup/table-gen)
+throughput : 17919.678 Mkeys/s
 FOUND scalar: 00000000000000000000000000000000000000000000000000000153869acc5b
 PRIVATE KEY : 00000000000000000000000000000000000000000000000000000153869acc5b
 target      : d1562eb37357f9e6fc41cb2359f4d3eda4032329
 MATCH       : YES
-searched    : 7.289e+11 / 1.100e+12 keys (66.29% of range)
+searched    : 7.320e+11 / 1.100e+12 keys (66.58% of range)
 result written to found.txt
 done
 ```
