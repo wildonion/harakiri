@@ -558,7 +558,7 @@ done
 > 41 bits key output on two 5090 RTX:
 
 ```
-./harakiri_sweep.exe --batch 1024 --jobs 87040 --range 10000000000:1ffffffffff --target 1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E --maxbatch 1000000 --out found.txt --sections 2
+./harakiri_sweep.exe --batch 1024 --jobs 87040 --range 10000000000:1ffffffffff --target 1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E --maxbatch 200 --out found.txt --sections 2
 
 === Harakiri Phase 2 sweep ===
 range start : 0000000000000000000000000000000000000000000000000000010000000000
@@ -572,7 +572,7 @@ CUDA driver/runtime: driver 13040, 2 device(s) visible
 GPU plan    : using 2 of 2 devices, 2 section(s) spread across them
 GPU 0       : NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs)
 GPU 1       : NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs)
-config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 total threads | grid=340 blocks | sections=1 (groupSize=87040) | backward=no | max_batches=6169 per launch | max_chunk=0000000000000000000000000000000000000000000000000000000000606400
+config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 total threads | grid=340 blocks | sections=1 (groupSize=87040) | backward=no | max_batches=200 per launch | max_chunk=0000000000000000000000000000000000000000000000000000000000606400
 
 === Harakiri Config Explained ===
 - batch            keys hashed per one field-inversion batch (B)
@@ -585,22 +585,22 @@ config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 tot
                    section start + a backward half from the section end
 - max_batches      batches per thread per kernel launch (auto-timeboxed to ~10s; add --maxbatch to override)
 - max_chunk        keys each thread owns = range / jobs
-config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 total threads | grid=340 blocks | sections=1 (groupSize=87040) | backward=no | max_batches=6169 per launch | max_chunk=0000000000000000000000000000000000000000000000000000000000606400
-[GPU 0][dbg] FOUND at launch 0: threadId=83635 finder_batch=4024
+config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 total threads | grid=340 blocks | sections=1 (groupSize=87040) | backward=no | max_batches=200 per launch | max_chunk=0000000000000000000000000000000000000000000000000000000000606400
+[GPU 0][dbg] FOUND at launch 20: threadId=83635 finder_batch=24
 
 === results ===
 devices     : 2 GPUs
-iterations : 2
-found on    : launch 0
-total keys : 911337297248
-sweep time : 49.755 s
-wall time  : 49.906 s (incl. warmup/table-gen)
-throughput : 18316.634 Mkeys/s
+iterations : 42
+found on    : launch 20
+total keys : 728864300352
+sweep time : 40.382 s
+wall time  : 40.496 s (incl. warmup/table-gen)
+throughput : 18049.066 Mkeys/s
 FOUND scalar: 00000000000000000000000000000000000000000000000000000153869acc5b
 PRIVATE KEY : 00000000000000000000000000000000000000000000000000000153869acc5b
 target      : d1562eb37357f9e6fc41cb2359f4d3eda4032329
 MATCH       : YES
-searched    : 9.113e+11 / 1.100e+12 keys (82.89% of range)
+searched    : 7.289e+11 / 1.100e+12 keys (66.29% of range)
 result written to found.txt
 done
 ```
