@@ -324,7 +324,9 @@ struct WorkerCtx {
   // output:
   unsigned long long total_hashes;
   double secs;
-  int iter;
+  int iter;                 // loop index at exit (not launch count)
+  int launches_done;        // launches actually executed, find launch included
+  int found_on_launch;      // 0-based launch that found the key, -1 if none
   bool found;
 };
 
@@ -557,6 +559,11 @@ static void device_worker(WorkerCtx& W) {
   unsigned long long total_hashes = 0;
   auto t0 = std::chrono::high_resolution_clock::now();
   int iter = 0;
+  // Launches actually executed, including the one that found the key. 'iter' is
+  // the 0-based loop index and is only bumped on the non-found path, so a run
+  // that stops on a find would otherwise report 0 regardless of the work done.
+  int launches_done = 0;
+  int found_on_launch = -1;     // -1 = not found; else 0-based launch index
   bool stop = false;
   FoundResult h_found;
   memset(&h_found, 0, sizeof(h_found));
@@ -622,6 +629,7 @@ static void device_worker(WorkerCtx& W) {
         d_found_flag, d_global_stop, d_found_result, d_hashes, d_any_left);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+    ++launches_done;
 
     unsigned long long h_hashes = 0;
     cudaMemcpy(&h_hashes, d_hashes, 8, cudaMemcpyDeviceToHost);
@@ -631,6 +639,7 @@ static void device_worker(WorkerCtx& W) {
     cudaMemcpy(&h_flag, d_found_flag, 4, cudaMemcpyDeviceToHost);
     if (h_flag == FOUND_READY) {
       cudaMemcpy(&h_found, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost);
+      found_on_launch = iter;
       printf("[GPU %d][dbg] FOUND at launch %d: threadId=%d finder_batch=%d\n",
              W.dev, iter, h_found.threadId, h_found.iter);
       // publish winner under lock
@@ -675,7 +684,7 @@ static void device_worker(WorkerCtx& W) {
     if (!W.self_test && !W.range_is_infinite && (auto_timebox || W.verbose)) {
       auto now = std::chrono::high_resolution_clock::now();
       double el = std::chrono::duration<double>(now - t0).count();
-      if (el > 0) {
+      if (el > 0 && total_hashes > 0) {
         double rate = total_hashes / el;
         double total_keys = (double)W.full_range_len[0]
                           + (double)W.full_range_len[1] * 18446744073709551616.0
@@ -711,6 +720,8 @@ static void device_worker(WorkerCtx& W) {
   W.total_hashes = total_hashes;
   W.secs = secs;
   W.iter = iter;
+  W.launches_done = launches_done;
+  W.found_on_launch = found_on_launch;
   W.found = (h_found.scalar[0] != 0);
 }
 
@@ -947,10 +958,12 @@ workers[d].warmup_sec = warmup_sec;
   // ---- aggregate results ----
   unsigned long long total_hashes = 0;
   int total_iter = 0;
+  int win_launch = -1;
   double total_secs = 0.0;
   for (int d = 0; d < used_gpus; ++d) {
     total_hashes += workers[d].total_hashes;
-    total_iter  += workers[d].iter;
+    total_iter  += workers[d].launches_done;
+    if (workers[d].found_on_launch >= 0) win_launch = workers[d].found_on_launch;
     if (workers[d].secs > total_secs) total_secs = workers[d].secs;
   }
   bool found = (shared_found.scalar[0] != 0);
@@ -958,13 +971,15 @@ workers[d].warmup_sec = warmup_sec;
   printf("\n=== results ===\n");
   if (used_gpus > 1) printf("devices     : %d GPUs\n", used_gpus);
   printf("iterations : %d\n", total_iter);
+  if (win_launch >= 0) printf("found on    : launch %d\n", win_launch);
   printf("total keys : %llu\n", total_hashes);
   printf("sweep time : %.3f s\n", total_secs);
   printf("wall time  : %.3f s (incl. warmup/table-gen)\n", wall_secs);
   if (total_secs > 0) printf("throughput : %.3f Mkeys/s\n", total_hashes / 1e6 / total_secs);
 
-  // ETA for the requested range at measured throughput (finite ranges only)
-  if (total_secs > 0 && !self_test && !range_is_infinite) {
+  // ETA for the requested range at measured throughput. Only meaningful when the
+  // range was exhausted WITHOUT a find: on a find the remaining keys are irrelevant.
+  if (total_secs > 0 && !self_test && !range_is_infinite && !found) {
     double total_keys = (double)range_len[0]
                       + (double)range_len[1] * 18446744073709551616.0
                       + (double)range_len[2] * 340282366920938463463374607431768211456.0
@@ -994,6 +1009,21 @@ workers[d].warmup_sec = warmup_sec;
       for (int k=0;k<20;++k) printf("%02x", target_hash160[k]);
       printf("\n");
       printf("MATCH       : YES\n");
+      // How much of the requested range was covered before the hit. The other
+      // GPUs stop draining once the global stop flag is set, so this is an
+      // upper bound on the fraction actually swept.
+      if (!range_is_infinite) {
+        double total_keys = (double)range_len[0]
+                          + (double)range_len[1] * 18446744073709551616.0
+                          + (double)range_len[2] * 340282366920938463463374607431768211456.0
+                          + (double)range_len[3] * 6277101735386680763835789423207666416102355444464034512896.0;
+        double done = (double)total_hashes;
+        if (total_keys > 0) {
+          double pct = (done < total_keys ? done : total_keys) / total_keys * 100.0;
+          printf("searched    : %.3e / %.3e keys (%.2f%% of range)\n",
+                 done, total_keys, pct);
+        }
+      }
     }
     if (!out_file.empty()) {
       char pk_buf[65]; le256_to_hex(shared_found.scalar, pk_buf);
@@ -1013,8 +1043,10 @@ workers[d].warmup_sec = warmup_sec;
         fprintf(f, "FOUND scalar: %s\n", pk_buf);
         fprintf(f, "PRIVATE KEY : %064s\n", pk_buf);
         fprintf(f, "total keys  : %llu\n", total_hashes);
+        fprintf(f, "launches    : %d\n", total_iter);
         fprintf(f, "sweep time  : %.3f s\n", total_secs);
-        fprintf(f, "throughput  : %.3f Mkeys/s\n", total_hashes / 1e6 / total_secs);
+        if (total_secs > 0)
+          fprintf(f, "throughput  : %.3f Mkeys/s\n", total_hashes / 1e6 / total_secs);
         fclose(f);
         printf("result written to %s\n", out_file.c_str());
       } else {

@@ -590,16 +590,17 @@ config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 tot
 
 === results ===
 devices     : 2 GPUs
-iterations : 0
-total keys : 926925482496
-sweep time : 51.342 s
-wall time  : 51.476 s (incl. warmup/table-gen)
-throughput : 18053.935 Mkeys/s
-ETA        : 9.6 s (range 1.100e+12 keys, done 9.269e+11)
+iterations : 2
+found on    : launch 0
+total keys : 911337297248
+sweep time : 49.755 s
+wall time  : 49.906 s (incl. warmup/table-gen)
+throughput : 18316.634 Mkeys/s
 FOUND scalar: 00000000000000000000000000000000000000000000000000000153869acc5b
 PRIVATE KEY : 00000000000000000000000000000000000000000000000000000153869acc5b
 target      : d1562eb37357f9e6fc41cb2359f4d3eda4032329
 MATCH       : YES
+searched    : 9.113e+11 / 1.100e+12 keys (82.89% of range)
 result written to found.txt
 done
 ```
