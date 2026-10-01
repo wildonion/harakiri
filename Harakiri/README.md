@@ -555,6 +555,55 @@ result written to found.txt
 done
 ```
 
+> 41 bits key output on two 5090 RTX:
+
+```
+./harakiri_sweep.exe --batch 1024 --jobs 87040 --range 10000000000:1ffffffffff --target 1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E --maxbatch 1000000 --out found.txt --sections 2
+
+=== Harakiri Phase 2 sweep ===
+range start : 0000000000000000000000000000000000000000000000000000010000000000
+batch size  : 1024
+selftest    : no
+backward    : no
+target      : d1562eb37357f9e6fc41cb2359f4d3eda4032329  (from address)
+CUDA driver/runtime: driver 13040, 2 device(s) visible
+  device 0: NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs, canMapHostMemory=1, unifiedAddressing=1)
+  device 1: NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs, canMapHostMemory=1, unifiedAddressing=1)
+GPU plan    : using 2 of 2 devices, 2 section(s) spread across them
+GPU 0       : NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs)
+GPU 1       : NVIDIA GeForce RTX 5090 (cc 12.0, 170 SMs)
+config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 total threads | grid=340 blocks | sections=1 (groupSize=87040) | backward=no | max_batches=6169 per launch | max_chunk=0000000000000000000000000000000000000000000000000000000000606400
+
+=== Harakiri Config Explained ===
+- batch            keys hashed per one field-inversion batch (B)
+- threads/block    block size (fixed 256, kernel launch bounds)
+- jobs             total worker threads = threads/block x grid blocks
+- grid             number of blocks = jobs / threads/block
+- sections         range split into N parallel slices; groupSize = jobs/N
+                   threads per slice (one slice per GPU on multi-GPU boxes)
+- backward         two-front race per section: a forward half from the
+                   section start + a backward half from the section end
+- max_batches      batches per thread per kernel launch (auto-timeboxed to ~10s; add --maxbatch to override)
+- max_chunk        keys each thread owns = range / jobs
+config      : batch=1024 keys per inversion | threads/block=256 | jobs=87040 total threads | grid=340 blocks | sections=1 (groupSize=87040) | backward=no | max_batches=6169 per launch | max_chunk=0000000000000000000000000000000000000000000000000000000000606400
+[GPU 0][dbg] FOUND at launch 0: threadId=83635 finder_batch=4024
+
+=== results ===
+devices     : 2 GPUs
+iterations : 0
+total keys : 926925482496
+sweep time : 51.342 s
+wall time  : 51.476 s (incl. warmup/table-gen)
+throughput : 18053.935 Mkeys/s
+ETA        : 9.6 s (range 1.100e+12 keys, done 9.269e+11)
+FOUND scalar: 00000000000000000000000000000000000000000000000000000153869acc5b
+PRIVATE KEY : 00000000000000000000000000000000000000000000000000000153869acc5b
+target      : d1562eb37357f9e6fc41cb2359f4d3eda4032329
+MATCH       : YES
+result written to found.txt
+done
+```
+
 # Harakiri — CUDA Architecture & Keyspace Splitting
 
 This document explains how the Harakiri sweep engine maps onto the CUDA

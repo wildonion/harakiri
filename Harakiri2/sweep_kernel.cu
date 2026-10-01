@@ -1,4 +1,4 @@
-// Harakiri Phase 2 ? affine sweep with one-inversion batch (Montgomery trick).
+// Harakiri Phase 2 — affine sweep with one-inversion batch (Montgomery trick).
 // Port of CUDACyclone's kernel_point_add_and_check_oneinv onto verified field.h/hash.h.
 // Each thread: holds base point P (x1,y1) + start scalar S, sweeps a batch of B=2*half
 // consecutive scalars per inversion, checking hash160(prefix||x) for each.
@@ -136,7 +136,14 @@ __global__ void kernel_point_add_and_check_oneinv(
 
     const unsigned lane      = (unsigned)(threadIdx.x & 31u);
     const unsigned full_mask = 0xFFFFFFFFu;
-    if (any_warp_stop(d_found_flag, d_global_stop, full_mask, lane)) return;
+    // Entry gate checks the DEVICE-LOCAL flag only. The host-mapped global
+    // stop flag is deliberately NOT read here: this is the first instruction of
+    // every thread, so on platforms where the pinned mapping is not coherently
+    // readable from the device (observed on multi-GPU WDDM) a garbage nonzero
+    // read makes all 10240 threads bail before hashing anything, which the host
+    // reports as "iterations: 0, total keys: 0, done". The host already tests
+    // *h_global_stop at the top of the launch loop, so nothing is lost.
+    if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
     // Hoist this group's stride point into registers ONCE (constant memory with
     // a runtime index [group] is slow; the old [4]-sized c_Jx was compile-time
@@ -223,7 +230,7 @@ __global__ void kernel_point_add_and_check_oneinv(
         {
             uint32_t h[5];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
-            hash160_33_from_x_fold(prefix, x1, h);
+            hash160_33_from_x_red(prefix, x1, h);
             ++local_hashes; MAYBE_WARP_FLUSH();
 #ifdef SWEEP_KERNEL_DEBUG
             if (gid == 30) {
@@ -328,7 +335,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 fieldReduce(s);
                 uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
-                uint32_t h[5]; hash160_33_from_x_fold(odd?0x03:0x02, px3, h);
+                uint32_t h[5]; hash160_33_from_x_red(odd?0x03:0x02, px3, h);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
                 bool pref = (h[0] == target_prefix);
@@ -386,7 +393,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 fieldReduce(s);
                 uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
-                uint32_t h[5]; hash160_33_from_x_fold(odd?0x03:0x02, px3, h);
+                uint32_t h[5]; hash160_33_from_x_red(odd?0x03:0x02, px3, h);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
                 bool pref = (h[0] == target_prefix);
@@ -456,7 +463,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 fieldReduce(s);
                 uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
-                uint32_t h[5]; hash160_33_from_x_fold(odd?0x03:0x02, px3, h);
+                uint32_t h[5]; hash160_33_from_x_red(odd?0x03:0x02, px3, h);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
                 bool pref = (h[0] == target_prefix);

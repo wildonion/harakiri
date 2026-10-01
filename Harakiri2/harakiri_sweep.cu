@@ -26,22 +26,18 @@
 
 #include "sweep_kernel.cu"   // kernel + __constant__ defs + FoundResult
 
+// Every CUDA call is checked. Without this, a launch that fails (out of
+// resources, bad device pointer, unmapped memory) leaves d_any_left == 0 and
+// d_hashes == 0, so the host loop reads it as "nothing left to do" and exits
+// silently with iterations=0, total keys=0.
+#define CUDA_CHECK(expr) do { cudaError_t _e = (expr); if (_e != cudaSuccess) { \
+  fprintf(stderr, "[CUDA ERROR] %s:%d: %s\n           -> %s\n", \
+          __FILE__, __LINE__, #expr, cudaGetErrorString(_e)); \
+  fflush(stderr); exit(2); } } while (0)
+
 // ---- device helper for self-test: hash160(prefix || x) ----
 __global__ void hash160_kernel(uint8_t prefix, const uint64_t* x_le, uint32_t* out160) {
   hash160_33_from_x(prefix, x_le, out160);
-}
-
-// Differential check: folded vs reference (byte-array) implementation must be
-// bit-exact on every sample. Runs once at startup (cheap).
-__global__ void hash160_fold_check_kernel(const uint64_t* x_le, const uint8_t* prefixes, uint32_t* mismatches, int N) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= N) return;
-  uint32_t hf[5], hr[5];
-  hash160_33_from_x_fold(prefixes[idx], x_le + (size_t)idx*4, hf);
-  hash160_33_from_x_red (prefixes[idx], x_le + (size_t)idx*4, hr);
-  bool bad = false;
-  for (int k = 0; k < 5; ++k) if (hf[k] != hr[k]) bad = true;
-  if (bad) atomicAdd(mismatches, 1u);
 }
 
 // ---- host-side SHA-256 (single block) for Base58Check checksum ----
@@ -363,21 +359,26 @@ static void device_worker(WorkerCtx& W) {
   cudaMemcpyToSymbol(c_target_hash160, W.target_hash160, 20);
 
   const uint32_t half = W.B/2;
+  if (half == 0 || (half & 1u) || half > MAX_BATCH_SIZE/2) {
+    fprintf(stderr, "error: invalid batch size %u (must be even, 2..%d)\n", W.B, MAX_BATCH_SIZE);
+    exit(1);
+  }
   {
     std::vector<uint64_t> h_sc(half*4), h_gx(half*4), h_gy(half*4);
     for (uint32_t k = 0; k < half; ++k) {
       h_sc[k*4+0] = (uint64_t)(k+1); h_sc[k*4+1]=0; h_sc[k*4+2]=0; h_sc[k*4+3]=0;
     }
     uint64_t *d_s, *d_x, *d_y;
-    cudaMalloc(&d_s, half*32); cudaMalloc(&d_x, half*32); cudaMalloc(&d_y, half*32);
-    cudaMemcpy(d_s, h_sc.data(), half*32, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc(&d_s, half*32)); CUDA_CHECK(cudaMalloc(&d_x, half*32)); CUDA_CHECK(cudaMalloc(&d_y, half*32));
+    CUDA_CHECK(cudaMemcpy(d_s, h_sc.data(), half*32, cudaMemcpyHostToDevice));
     int blk = (int)((half + 255)/256);
     scalarMulBaseKernel<<<blk,256>>>(d_s, d_x, d_y, (int)half);
-    cudaDeviceSynchronize();
-    cudaMemcpy(h_gx.data(), d_x, half*32, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_gy.data(), d_y, half*32, cudaMemcpyDeviceToHost);
-    cudaMemcpyToSymbol(c_Gx, h_gx.data(), half*32);
-    cudaMemcpyToSymbol(c_Gy, h_gy.data(), half*32);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_gx.data(), d_x, half*32, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_gy.data(), d_y, half*32, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_Gx, h_gx.data(), half*32));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_Gy, h_gy.data(), half*32));
     cudaFree(d_s); cudaFree(d_x); cudaFree(d_y);
   }
 
@@ -398,12 +399,18 @@ static void device_worker(WorkerCtx& W) {
     if (!back) {
       for (int k=0;k<4;++k) grp_len[g*4+k] = W.sections[s].len[k];
     } else {
-      // half = ceil(len/2); forward gets the lower half, backward the upper half
-      uint64_t half[4], rem[4];
-      div256_u64(W.sections[s].len, 2, half, &rem[0]); // half = len/2 (floor)
-      if (rem[0]) add256_u64(half, 1);                 // half = ceil(len/2)
-      if (d > 0) { for (int k=0;k<4;++k) grp_len[g*4+k] = half[k]; }
-      else { for (int k=0;k<4;++k) grp_len[g*4+k] = W.sections[s].len[k] - half[k]; }
+      // halfk = ceil(len/2); forward gets the lower half, backward the upper half.
+      // Named halfk to avoid shadowing the batch `half` (W.B/2) from above.
+      uint64_t halfk[4], rem;
+      div256_u64(W.sections[s].len, 2, halfk, &rem);    // halfk = len/2 (floor)
+      if (rem) add256_u64(halfk, 1);                    // halfk = ceil(len/2)
+      if (d > 0) { for (int k=0;k<4;++k) grp_len[g*4+k] = halfk[k]; }
+      else {
+        // len - ceil(len/2) wraps to ~2^256 when len == 0; clamp to 0.
+        bool zero = (W.sections[s].len[0]|W.sections[s].len[1]|
+                     W.sections[s].len[2]|W.sections[s].len[3]) == 0;
+        for (int k=0;k<4;++k) grp_len[g*4+k] = zero ? 0 : (W.sections[s].len[k] - halfk[k]);
+      }
     }
   }
 
@@ -420,6 +427,12 @@ static void device_worker(WorkerCtx& W) {
     if ((grp_chunk[g*4+0]|grp_chunk[g*4+1]|grp_chunk[g*4+2]|grp_chunk[g*4+3]) == 0)
       add256_u64(&grp_chunk[g*4], (uint64_t)W.B);
   }
+
+  if ((threadsTotal & (W.threads_per_block - 1)) != 0)
+    fprintf(stderr, "warning: jobs=%llu is not a multiple of threads/block=%u; "
+                    "%llu threads will launch\n",
+            (unsigned long long)threadsTotal, W.threads_per_block,
+            (unsigned long long)(((threadsTotal + W.threads_per_block - 1) / W.threads_per_block) * W.threads_per_block));
 
   // ---- per-thread start/count: thread gid -> group = gid/groupSize, local = gid%groupSize ----
   // forward thread : S0 = A + local*B + half   (march up)
@@ -473,24 +486,25 @@ static void device_worker(WorkerCtx& W) {
   unsigned long long *d_hashes;
   unsigned int *d_any_left;
 
-  cudaMalloc(&d_start, threadsTotal*32);
-  cudaMalloc(&d_cnt,   threadsTotal*32);
-  cudaMalloc(&d_Px,    threadsTotal*32);
-  cudaMalloc(&d_Py,    threadsTotal*32);
-  cudaMalloc(&d_Rx,    threadsTotal*32);
-  cudaMalloc(&d_Ry,    threadsTotal*32);
-  cudaMalloc(&d_found_flag, 4);
-  cudaMalloc(&d_found_result, sizeof(FoundResult));
-  cudaMalloc(&d_hashes, 8);
-  cudaMalloc(&d_any_left, 4);
+  CUDA_CHECK(cudaMalloc(&d_start, threadsTotal*32));
+  CUDA_CHECK(cudaMalloc(&d_cnt,   threadsTotal*32));
+  CUDA_CHECK(cudaMalloc(&d_Px,    threadsTotal*32));
+  CUDA_CHECK(cudaMalloc(&d_Py,    threadsTotal*32));
+  CUDA_CHECK(cudaMalloc(&d_Rx,    threadsTotal*32));
+  CUDA_CHECK(cudaMalloc(&d_Ry,    threadsTotal*32));
+  CUDA_CHECK(cudaMalloc(&d_found_flag, 4));
+  CUDA_CHECK(cudaMalloc(&d_found_result, sizeof(FoundResult)));
+  CUDA_CHECK(cudaMalloc(&d_hashes, 8));
+  CUDA_CHECK(cudaMalloc(&d_any_left, 4));
 
-  cudaMemcpy(d_start, h_start.data(), threadsTotal*32, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_cnt,   h_cnt.data(),   threadsTotal*32, cudaMemcpyHostToDevice);
+  CUDA_CHECK(cudaMemcpy(d_start, h_start.data(), threadsTotal*32, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_cnt,   h_cnt.data(),   threadsTotal*32, cudaMemcpyHostToDevice));
 
   // compute P = start*G
   int blk = (int)((threadsTotal + 255)/256);
   scalarMulBaseKernel<<<blk,256>>>(d_start, d_Px, d_Py, (int)threadsTotal);
-  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
 
   // ---- VERIFY: hash thread 30's base point (should equal target for selftest) ----
   if (W.self_test) {
@@ -593,7 +607,7 @@ static void device_worker(WorkerCtx& W) {
 
   // device pointer to shared host-mapped stop flag
   int* d_global_stop = nullptr;
-  cudaHostGetDevicePointer(&d_global_stop, W.h_global_stop, 0);
+  CUDA_CHECK(cudaHostGetDevicePointer(&d_global_stop, W.h_global_stop, 0));
 
   while (!stop) {
     if (*W.h_global_stop != 0) { stop = true; break; }   // another device found
@@ -606,7 +620,8 @@ static void device_worker(WorkerCtx& W) {
     kernel_point_add_and_check_oneinv<<<grid, W.threads_per_block>>>(
         d_Px, d_Py, d_Rx, d_Ry, d_start, d_cnt, threadsTotal, groupSize, W.B, max_batches,
         d_found_flag, d_global_stop, d_found_result, d_hashes, d_any_left);
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     unsigned long long h_hashes = 0;
     cudaMemcpy(&h_hashes, d_hashes, 8, cudaMemcpyDeviceToHost);
@@ -636,6 +651,20 @@ static void device_worker(WorkerCtx& W) {
       cudaMemcpy(dbg_cnt, d_cnt, 32, cudaMemcpyDeviceToHost);
       printf("  [GPU %d][dbg] launch %d: hashes=%llu flag=%d any_left=%u rem0=%llu\n",
              W.dev, iter, h_hashes, h_flag, h_any, dbg_cnt[0]);
+    }
+    // If the first launch did zero work while threads still have a positive
+    // remaining count, the kernel bailed at its entry gate. Say so instead of
+    // printing "0 keys, done" and looking like a finished (empty) sweep.
+    if (iter == 0 && h_hashes == 0 && h_any == 0) {
+      uint64_t dbg_cnt[4];
+      cudaMemcpy(dbg_cnt, d_cnt, 32, cudaMemcpyDeviceToHost);
+      fprintf(stderr,
+        "[GPU %d][FATAL] first launch hashed nothing and no thread reported work left.\n"
+        "         thread0 remaining keys = %llu (expected >= %u).\n"
+        "         The kernel exited at its entry gate before hashing.\n", W.dev,
+        (unsigned long long)dbg_cnt[0], W.B);
+      fflush(stderr);
+      exit(3);
     }
     if (h_any == 0) { stop = true; break; }
 
@@ -683,31 +712,6 @@ static void device_worker(WorkerCtx& W) {
   W.secs = secs;
   W.iter = iter;
   W.found = (h_found.scalar[0] != 0);
-}
-
-// Differential hash check: folded vs reference must be bit-exact on many
-// random x values. Returns true on pass. Called once at startup.
-static bool run_fold_check() {
-  const int N = 4096;
-  std::vector<uint64_t> xs(N*4);
-  std::vector<uint8_t>  px(N);
-  srand(0x5EED);
-  for (int i = 0; i < N; ++i) {
-    for (int k = 0; k < 4; ++k) xs[i*4+k] = ((uint64_t)rand() << 32) ^ (uint64_t)rand();
-    px[i] = (rand() & 1) ? 0x02 : 0x03;
-  }
-  uint64_t *d_x; uint8_t *d_p; uint32_t *d_m;
-  cudaMalloc(&d_x, N*32); cudaMalloc(&d_p, N); cudaMalloc(&d_m, 4);
-  cudaMemcpy(d_x, xs.data(), N*32, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_p, px.data(), N, cudaMemcpyHostToDevice);
-  cudaMemset(d_m, 0, 4);
-  hash160_fold_check_kernel<<<(N+255)/256, 256>>>(d_x, d_p, d_m, N);
-  cudaDeviceSynchronize();
-  uint32_t mism = 0;
-  cudaMemcpy(&mism, d_m, 4, cudaMemcpyDeviceToHost);
-  cudaFree(d_x); cudaFree(d_p); cudaFree(d_m);
-  printf("  [fold check] %d random x's vs reference: %s\n", N, mism ? "MISMATCH!" : "bit-exact PASS");
-  return mism == 0;
 }
 
 // ---- main ------------------------------------------------------------------
@@ -859,9 +863,21 @@ int main(int argc, char** argv) {
     if (std::string(argv[i]) == "--jobs") jobs_explicit = true;
 
   int ndev = 0;
-  cudaGetDeviceCount(&ndev);
+  CUDA_CHECK(cudaGetDeviceCount(&ndev));
   if (ndev < 1) { fprintf(stderr, "no CUDA device found\n"); return 1; }
-  if (!run_fold_check()) { fprintf(stderr, "fold check FAILED - aborting\n"); return 1; }
+  {
+    int drv = 0;
+    cudaDriverGetVersion(&drv);
+    printf("CUDA driver/runtime: driver %d, %d device(s) visible\n", drv, ndev);
+    for (int i = 0; i < ndev; ++i) {
+      cudaDeviceProp p;
+      if (cudaGetDeviceProperties(&p, i) == cudaSuccess)
+        printf("  device %d: %s (cc %d.%d, %d SMs, canMapHostMemory=%d, "
+               "unifiedAddressing=%d)\n", i, p.name, p.major, p.minor,
+               p.multiProcessorCount, (int)p.canMapHostMemory,
+               (int)p.unifiedAddressing);
+    }
+  }
 if (sections < 1) { fprintf(stderr, "--sections must be >= 1\n"); return 1; }
   if (sections > MAX_SECTIONS) { fprintf(stderr, "--sections too large (max %d)\n", MAX_SECTIONS); return 1; }
   if (backward && 2*sections > MAX_SECTIONS) { fprintf(stderr, "--backward doubles the grid: max --sections with --backward is %d\n", MAX_SECTIONS/2); return 1; }

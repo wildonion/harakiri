@@ -136,7 +136,14 @@ __global__ void kernel_point_add_and_check_oneinv(
 
     const unsigned lane      = (unsigned)(threadIdx.x & 31u);
     const unsigned full_mask = 0xFFFFFFFFu;
-    if (any_warp_stop(d_found_flag, d_global_stop, full_mask, lane)) return;
+    // Entry gate checks the DEVICE-LOCAL flag only. The host-mapped global
+    // stop flag is deliberately NOT read here: this is the first instruction of
+    // every thread, so on platforms where the pinned mapping is not coherently
+    // readable from the device (observed on multi-GPU WDDM) a garbage nonzero
+    // read makes all 10240 threads bail before hashing anything, which the host
+    // reports as "iterations: 0, total keys: 0, done". The host already tests
+    // *h_global_stop at the top of the launch loop, so nothing is lost.
+    if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
     // Hoist this group's stride point into registers ONCE (constant memory with
     // a runtime index [group] is slow; the old [4]-sized c_Jx was compile-time
