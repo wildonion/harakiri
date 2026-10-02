@@ -46,6 +46,9 @@ __constant__ uint64_t c_Jy[MAX_SECTIONS][4];
 __constant__ int      c_dir[MAX_SECTIONS];      // +1 forward group, -1 backward group
 __constant__ uint32_t c_target_prefix;            // first 4 bytes of hash160 as LE u32
 __constant__ uint8_t  c_target_hash160[20];
+// 0 = per-key hash160_33_from_x_red (default), 1 = paired 2x hash (--multibuffer).
+// Both paths are checked against the reference by hash_selftest_kernel before use.
+__constant__ int      c_multibuffer;
 
 __device__ __forceinline__ int load_found_flag_relaxed(const int* p) {
   return *((const volatile int*)p);
@@ -307,7 +310,107 @@ __global__ void kernel_point_add_and_check_oneinv(
         ModNeg256(sy_neg, y1);
         ModNeg256(sx_neg, x1);
 
+        // Filter + report one side. PX3/LAM are that side's point; SIG is +1 for
+        // "+(i+1)G" and -1 for "-(i+1)G" (only flips the scalar stored on a hit).
+        // Shared by the 1x and --multibuffer paths so the two can never diverge
+        // in how a hit is recognised or reported.
+#define SWEEP_SIDE_CHECK(h, PX3, LAM, SIG) do { \
+    bool pref_ = ((h)[0] == target_prefix); \
+    if (__any_sync(full_mask, pref_)) { \
+        uint8_t h20[20]; \
+        for (int k=0;k<5;++k) { \
+            h20[k*4+0]=(uint8_t)((h)[k]      ); \
+            h20[k*4+1]=(uint8_t)((h)[k] >> 8 ); \
+            h20[k*4+2]=(uint8_t)((h)[k] >> 16); \
+            h20[k*4+3]=(uint8_t)((h)[k] >> 24); \
+        } \
+        bool full_ = true; \
+        for (int k=0;k<20;++k) if (h20[k]!=c_target_hash160[k]) full_=false; \
+        if (pref_ && full_) { \
+            if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) { \
+                uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k]; \
+                if ((SIG) > 0) { \
+                    uint64_t addv=(uint64_t)(i+1); \
+                    for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; } \
+                } else { \
+                    uint64_t sub=(uint64_t)(i+1); \
+                    for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; } \
+                } \
+                for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k]; \
+                for (int k=0;k<4;++k) d_found_result->Rx[k]=(PX3)[k]; \
+                uint64_t y3[4]; uint64_t t[4]; \
+                ModSub256(t, x1, (PX3)); _ModMult(y3, t, (LAM)); ModSub256(y3, y3, y1); \
+                for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k]; \
+                d_found_result->threadId = (int)gid; \
+                d_found_result->iter     = (int)batches_done; \
+                __threadfence_system(); \
+                atomicExch(d_found_flag, FOUND_READY); \
+            } \
+        } \
+        if (__any_sync(full_mask, pref_ && full_)) { \
+            __syncwarp(full_mask); DBG_EXIT("found-x"); WARP_FLUSH_HASHES(); return; \
+        } \
+    } \
+} while (0)
+
         // --- main sweep: i in 0..half-2, both + and - sides ---
+        if (c_multibuffer) {
+        // --multibuffer: compute BOTH side points first, then hash them in one
+        // interleaved pass. Two independent serial hash chains per thread may
+        // fill the warp's issue width better than one.
+        for (int i = 0; i < half - 1; ++i) {
+            if (warp_found_ready(d_found_flag, full_mask, lane)) { DBG_EXIT("stop-inner"); WARP_FLUSH_HASHES(); return; }
+
+            uint64_t dx_inv_i[4];
+            _ModMult(dx_inv_i, subp[i], inverse);
+
+            uint64_t px3_p[4], lam_p[4], px3_m[4], lam_m[4];
+            uint8_t pfx_p, pfx_m;
+            {
+                uint64_t s[4];
+                uint64_t px_i[4], py_i[4];
+#pragma unroll
+                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
+
+                ModSub256(s, py_i, y1);
+                _ModMult(lam_p, s, dx_inv_i);
+                _ModSqr(px3_p, lam_p);
+                ModSub256(px3_p, px3_p, x1);
+                ModSub256(px3_p, px3_p, px_i);
+                ModSub256(s, x1, px3_p);
+                _ModMult(s, s, lam_p);
+                fieldReduce(s);
+                uint8_t odd_p; ModSub256isOdd(s, y1, &odd_p);
+                pfx_p = odd_p ? 0x03 : 0x02;
+
+                ModNeg256(py_i, py_i);
+                ModSub256(s, py_i, y1);
+                _ModMult(lam_m, s, dx_inv_i);
+                _ModSqr(px3_m, lam_m);
+                ModSub256(px3_m, px3_m, x1);
+                ModSub256(px3_m, px3_m, px_i);
+                ModSub256(s, x1, px3_m);
+                _ModMult(s, s, lam_m);
+                fieldReduce(s);
+                uint8_t odd_m; ModSub256isOdd(s, y1, &odd_m);
+                pfx_m = odd_m ? 0x03 : 0x02;
+            }
+
+            uint32_t hp[5], hm[5];
+            hash160_33_from_x_red_2x(pfx_p, px3_p, hp, pfx_m, px3_m, hm);
+            local_hashes += 2; MAYBE_WARP_FLUSH();
+
+            SWEEP_SIDE_CHECK(hp, px3_p, lam_p, +1);
+            SWEEP_SIDE_CHECK(hm, px3_m, lam_m, -1);
+
+            uint64_t gxmi[4];
+#pragma unroll
+            for (int j=0;j<4;++j) gxmi[j] = c_Gx[(size_t)i*4 + j];
+            ModSub256(gxmi, gxmi, x1);
+            _ModMult(inverse, inverse, gxmi);
+        }
+        } else {
+        // default: hash each side separately
         for (int i = 0; i < half - 1; ++i) {
             // device-local flag only (on-device volatile read is fast; the
             // host-mapped global flag is polled once per batch at loop top)
@@ -338,39 +441,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint32_t h[5]; hash160_33_from_x_red(odd?0x03:0x02, px3, h);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool pref = (h[0] == target_prefix);
-                if (__any_sync(full_mask, pref)) {
-                    uint8_t h20[20];
-                    for (int k=0;k<5;++k) {
-                        h20[k*4+0]=(uint8_t)(h[k]      );
-                        h20[k*4+1]=(uint8_t)(h[k] >> 8 );
-                        h20[k*4+2]=(uint8_t)(h[k] >> 16);
-                        h20[k*4+3]=(uint8_t)(h[k] >> 24);
-                    }
-                    bool full = true;
-                    for (int k=0;k<20;++k) if (h20[k]!=c_target_hash160[k]) full=false;
-                    if (pref && full) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t addv=(uint64_t)(i+1);
-                            for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = (int)batches_done;
-                            __threadfence_system();
-                            atomicExch(d_found_flag, FOUND_READY);
-                        }
-                    }
-                    if (__any_sync(full_mask, pref && full)) {
-                        __syncwarp(full_mask); DBG_EXIT("found-x"); WARP_FLUSH_HASHES(); return;
-                    }
-                }
+                SWEEP_SIDE_CHECK(h, px3, lam, +1);
             }
 
             // - (i+1)*G
@@ -396,39 +467,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint32_t h[5]; hash160_33_from_x_red(odd?0x03:0x02, px3, h);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool pref = (h[0] == target_prefix);
-                if (__any_sync(full_mask, pref)) {
-                    uint8_t h20[20];
-                    for (int k=0;k<5;++k) {
-                        h20[k*4+0]=(uint8_t)(h[k]      );
-                        h20[k*4+1]=(uint8_t)(h[k] >> 8 );
-                        h20[k*4+2]=(uint8_t)(h[k] >> 16);
-                        h20[k*4+3]=(uint8_t)(h[k] >> 24);
-                    }
-                    bool full = true;
-                    for (int k=0;k<20;++k) if (h20[k]!=c_target_hash160[k]) full=false;
-                    if (pref && full) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t sub=(uint64_t)(i+1);
-                            for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = (int)batches_done;
-                            __threadfence_system();
-                            atomicExch(d_found_flag, FOUND_READY);
-                        }
-                    }
-                    if (__any_sync(full_mask, pref && full)) {
-                        __syncwarp(full_mask); DBG_EXIT("found-x"); WARP_FLUSH_HASHES(); return;
-                    }
-                }
+                SWEEP_SIDE_CHECK(h, px3, lam, -1);
             }
 
             uint64_t gxmi[4];
@@ -437,6 +476,8 @@ __global__ void kernel_point_add_and_check_oneinv(
             ModSub256(gxmi, gxmi, x1);
             _ModMult(inverse, inverse, gxmi);
         }
+        }   // end else (1x default path)
+#undef SWEEP_SIDE_CHECK
 
         // --- last: i = half-1, only - half*G side, then advance base by J=B*G ---
         {

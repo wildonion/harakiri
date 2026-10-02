@@ -42,6 +42,45 @@ __global__ void hash160_kernel(uint8_t prefix, const uint64_t* x_le, uint32_t* o
   hash160_33_from_x(prefix, x_le, out160);
 }
 
+// ---- correctness gate for the multi-buffer hash -----------------------------
+// A wrong hash does not crash the sweep, it silently stops finding keys. So
+// compare hash160_33_from_x_red_2x against the reference hash160_33_from_x and
+// the production 1x reduced variant over a large randomised input set, and also
+// check 2x(A,B) == 2x(B,A) to catch cross-wired chains. Returns a mismatch count.
+__global__ void hash_selftest_kernel(uint64_t seed, int n, int* mismatches) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  uint64_t st = seed ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(i + 1));
+  #pragma unroll
+  for (int k = 0; k < 4; ++k) { st ^= st << 13; st ^= st >> 7; st ^= st << 17; }
+  uint64_t xa[4] = {st, st * 0x100000001B3ULL, st ^ 0xDEADBEEFCAFEBABEULL, st + 0x165667B19E3779F9ULL};
+  st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+  uint64_t xb[4] = {st, st + 0x27D4EB2F165667C5ULL, st * 0x2545F4914F6CDD1DULL, st ^ 0xB7E151628AED2A6BULL};
+  uint8_t pa = (uint8_t)((xa[0] & 1) ? 0x03 : 0x02);
+  uint8_t pb = (uint8_t)((xb[1] & 1) ? 0x03 : 0x02);
+
+  uint32_t ha[5], hb[5];
+  hash160_33_from_x_red_2x(pa, xa, ha, pb, xb, hb);
+
+  uint32_t ra[5], rb[5], na[5], nb[5], sw[5], sw2[5];
+  hash160_33_from_x(pa, xa, ra);
+  hash160_33_from_x_red(pa, xa, na);
+  hash160_33_from_x(pb, xb, rb);
+  hash160_33_from_x_red(pb, xb, nb);
+  hash160_33_from_x_red_2x(pb, xb, sw, pa, xa, sw2);
+
+  int bad = 0;
+  for (int k = 0; k < 5; ++k) {
+    if (ha[k] != ra[k])  bad++;
+    if (ha[k] != na[k])  bad++;
+    if (hb[k] != rb[k])  bad++;
+    if (hb[k] != nb[k])  bad++;
+    if (ha[k] != sw2[k]) bad++;
+    if (hb[k] != sw[k])  bad++;
+  }
+  if (bad) atomicAdd(mismatches, bad);
+}
+
 // ---- host-side SHA-256 (single block) for Base58Check checksum ----
 static void host_sha256(const uint8_t* msg, size_t len, uint8_t out[32]) {
   static const uint32_t K[64] = {
@@ -340,6 +379,7 @@ struct WorkerCtx {
   uint32_t prefix_le;
   int warmup_sec;
   bool backward;                          // two-front race: forward half + backward half per section
+  bool multibuffer;                       // --multibuffer: pair +/- sides into one 2x hash
   bool range_is_infinite;
   uint64_t full_range_len[4];           // whole range (for ETA)
   // shared across devices:
@@ -384,6 +424,8 @@ static void device_worker(WorkerCtx& W) {
   // ---- constants + table generation (constant memory is per-device) ----
   cudaMemcpyToSymbol(c_target_prefix, &W.prefix_le, 4);
   cudaMemcpyToSymbol(c_target_hash160, W.target_hash160, 20);
+  { int mb = W.multibuffer ? 1 : 0;
+    cudaMemcpyToSymbol(c_multibuffer, &mb, sizeof(int)); }
 
   const uint32_t half = W.B/2;
   if (half == 0 || (half & 1u) || half > MAX_BATCH_SIZE/2) {
@@ -768,6 +810,8 @@ int main(int argc, char** argv) {
   int sections = 1;       // --sections N: split range into N parallel sections
   bool backward = false;  // --backward: two-front race (forward + backward halves per section)
   std::vector<int> gpu_ids;  // --gpui 0,1,2: explicit device list; empty = 0..N-1
+  bool hash_test = false;   // --hashtest: run the hash gate and exit
+  bool g_multibuffer = false; // --multibuffer: pair the +/- sides into one 2x hash
 
   // parse args
   for (int i = 1; i < argc; ++i) {
@@ -829,11 +873,45 @@ int main(int argc, char** argv) {
     else if (a == "--backward") backward = true;
     else if (a == "--verbose") verbose = true;
     else if (a == "--selftest") self_test = true;
+    else if (a == "--hashtest") hash_test = true;
+    else if (a == "--multibuffer") g_multibuffer = true;
+  }
+
+  // ---- hash correctness gate ----
+  // The multi-buffer hash is the highest-risk code in the solver: if it drifts,
+  // the sweep still runs at full speed and simply never finds anything. Gate
+  // it on every invocation (2M comparisons costs milliseconds) and abort hard.
+  if (hash_test || true) {
+    int* d_bad = nullptr;
+    int h_bad = 0;
+    if (cudaMalloc(&d_bad, 4) != cudaSuccess) { fprintf(stderr, "error: hash self-test alloc failed\n"); return 1; }
+    cudaMemset(d_bad, 0, 4);
+    const int HN = 1 << 20;
+    hash_selftest_kernel<<<(HN + 255) / 256, 256>>>(0x5EED1234ABCDULL, HN, d_bad);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+      fprintf(stderr, "error: hash self-test launch: %s\n", cudaGetErrorString(e));
+      return 1;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(&h_bad, d_bad, 4, cudaMemcpyDeviceToHost));
+    cudaFree(d_bad);
+    if (h_bad != 0) {
+      fprintf(stderr, "\n*** FATAL: multi-buffer hash mismatch (%d of %d words differ) ***\n"
+              "    2x hash disagrees with the reference/1x hash. Refusing to run: a\n"
+              "    wrong hash would silently return no findings.\n", h_bad, HN * 5 * 6);
+      return 1;
+    }
+    if (hash_test) {
+      printf("hash selftest: PASS (%d inputs, 0 mismatches vs reference + 1x + swapped)\n", HN);
+      return 0;
+    }
   }
 
   if (range_hex.empty()) {
-    fprintf(stderr, "usage: harakiri_sweep [--batch B] [--threads T] [--range start_hex[:len_dec]] "
-            "[--target hex160] [--iters N] [--sections N] [--backward] [--selftest]\n");
+fprintf(stderr, "usage: harakiri_sweep [--batch B] [--threads T] [--range start_hex[:len_dec]] "
+             "[--target hex160] [--iters N] [--sections N] [--backward] [--selftest] "
+             "[--multibuffer] [--hashtest]\n");
     return 1;
   }
 
@@ -1062,6 +1140,7 @@ if (sections < 1) { fprintf(stderr, "--sections must be >= 1\n"); return 1; }
     workers[d].prefix_le = prefix_le;
 workers[d].warmup_sec = warmup_sec;
     workers[d].backward = backward;
+  workers[d].multibuffer = g_multibuffer;
     workers[d].range_is_infinite = range_is_infinite;
     for (int k=0;k<4;++k) workers[d].full_range_len[k] = range_len[k];
   }
