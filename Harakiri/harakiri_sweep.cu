@@ -380,6 +380,16 @@ struct WorkerCtx {
   int warmup_sec;
   bool backward;                          // two-front race: forward half + backward half per section
   bool multibuffer;                       // --multibuffer: pair +/- sides into one 2x hash
+  // --global: one shared frontier across all GPUs. stride = global_T*B where
+  // global_T = sum of per-worker thread counts; worker di owns global batches
+  // di, di+D, di+2D, ... (D = device count). Kernel is unchanged: it is
+  // launched with groupSize = global_T so stride falls out as global_T*B.
+  bool global_stride;
+  uint64_t global_T;                      // total threads across all workers
+  uint64_t global_di;                     // this worker's index 0..D-1
+  uint64_t global_D;                      // number of workers sharing the frontier
+  uint64_t global_start[4];               // full range start (not the section slice)
+  uint64_t global_len[4];                 // full range length
   bool range_is_infinite;
   uint64_t full_range_len[4];           // whole range (for ETA)
   // shared across devices:
@@ -420,6 +430,29 @@ static void device_worker(WorkerCtx& W) {
   uint64_t groupSize = (threadsTotal / (uint64_t)G) & ~0xFFull;
   if (groupSize < 256) groupSize = 256;
   threadsTotal = groupSize * (uint64_t)G;
+
+  // --global: kernel-visible group size is the cross-GPU total so that
+  // stride (= kGroupSize*B) advances the shared frontier. Local gid values
+  // (0..threadsTotal-1) all map to group 0; the device offset is encoded in
+  // each thread's start scalar below (gid*D+di) and in the shared J point.
+  uint64_t kGroupSize = groupSize;
+  uint64_t g_chunk[4] = {0,0,0,0};   // valid only when global_stride
+  uint64_t g_end[4] = {0,0,0,0};
+  if (W.global_stride) {
+    if (back || S != 1) { fprintf(stderr, "[GPU %d][FATAL] --global needs 1 forward section per GPU\n", W.dev); exit(1); }
+    if (W.global_T < threadsTotal) { fprintf(stderr, "[GPU %d][FATAL] global_T < local threads\n", W.dev); exit(1); }
+    kGroupSize = W.global_T;
+    // chunk = ceil(global_len / global_T), rounded up to a B multiple
+    uint64_t q[4], r;
+    div256_u64(W.global_len, W.global_T, q, &r);
+    if (r) add256_u64(q, 1);
+    uint64_t tmp[4], rm;
+    div256_u64(q, (uint64_t)W.B, tmp, &rm);
+    if (rm) add256_u64(q, (uint64_t)W.B - rm);
+    for (int k=0;k<4;++k) g_chunk[k] = q[k];
+    for (int k=0;k<4;++k) g_end[k] = W.global_start[k];
+    add256(g_end, W.global_len);
+  }
 
   // ---- constants + table generation (constant memory is per-device) ----
   cudaMemcpyToSymbol(c_target_prefix, &W.prefix_le, 4);
@@ -496,6 +529,13 @@ static void device_worker(WorkerCtx& W) {
     if ((grp_chunk[g*4+0]|grp_chunk[g*4+1]|grp_chunk[g*4+2]|grp_chunk[g*4+3]) == 0)
       add256_u64(&grp_chunk[g*4], (uint64_t)W.B);
   }
+  // --global: per-thread counts come from the shared chunk (set in the
+  // start/count loop); the launch bound uses it too.
+  if (W.global_stride) {
+    for (int k=0;k<4;++k) grp_chunk[k] = g_chunk[k];
+    if ((grp_chunk[0]|grp_chunk[1]|grp_chunk[2]|grp_chunk[3]) == 0)
+      add256_u64(&grp_chunk[0], (uint64_t)W.B);
+  }
 
   if ((threadsTotal & (W.threads_per_block - 1)) != 0)
     fprintf(stderr, "warning: jobs=%llu is not a multiple of threads/block=%u; "
@@ -506,10 +546,23 @@ static void device_worker(WorkerCtx& W) {
   // ---- per-thread start/count: thread gid -> group = gid/groupSize, local = gid%groupSize ----
   // forward thread : S0 = A + local*B + half   (march up)
   // backward thread: S0 = A+len - local*B - half (march down; A+len = section end)
+  // --global      : S0 = GSTART + (gid*D+di)*B + half (shared frontier interleave)
   std::vector<uint64_t> h_start(threadsTotal*4), h_cnt(threadsTotal*4);
   for (uint64_t gid = 0; gid < threadsTotal; ++gid) {
-    uint64_t group = gid / groupSize;
-    uint64_t local = gid % groupSize;
+    uint64_t group = gid / kGroupSize;
+    uint64_t local = gid % kGroupSize;
+    if (W.global_stride) {
+      // single group; gid < threadsTotal <= global_T so group == 0
+      uint64_t tbatch = (gid * W.global_D + W.global_di) * (uint64_t)W.B;
+      uint64_t S0[4], bstart[4];
+      for (int k=0;k<4;++k) { S0[k] = W.global_start[k]; bstart[k] = W.global_start[k]; }
+      add256_u64(bstart, tbatch);
+      add256_u64(S0, tbatch);
+      inc256(S0, (uint64_t)(W.B / 2));
+      bool past_end = ge256(bstart, g_end);
+      for (int k=0;k<4;++k) { h_start[gid*4+k] = S0[k]; h_cnt[gid*4+k] = past_end ? 0 : g_chunk[k]; }
+      continue;
+    }
     int s = grp_sec[(int)group];
     int d = grp_dir[(int)group];
     uint64_t S0[4];
@@ -530,12 +583,14 @@ static void device_worker(WorkerCtx& W) {
     for (int k=0;k<4;++k) { h_start[gid*4+k] = S0[k]; h_cnt[gid*4+k] = grp_chunk[(int)group*4+k]; }
   }
 
-  // ---- per-group stride point c_Jx[g] = (groupSize*B)*G ----
+  // ---- per-group stride point c_Jx[g] = (kGroupSize*B)*G ----
+  // --global: single shared J = (global_T*B)*G on every worker so all GPUs
+  // advance the same frontier. Forward only (enforced above).
   // The J magnitude is the same for every group: (groupSize*B)*G. Forward groups
   // upload +J; backward groups upload -J = (Jx, p-Jy) so the identical point-add
   // in the kernel advances the base point DOWNWARD.
   {
-    uint64_t jsc[4] = {groupSize * (uint64_t)W.B, 0, 0, 0}, Jx[4], Jy[4];
+    uint64_t jsc[4] = {kGroupSize * (uint64_t)W.B, 0, 0, 0}, Jx[4], Jy[4];
     scalar_mul_g(jsc, Jx, Jy);
     const uint64_t P_LE[4] = {0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
                               0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL};
@@ -660,9 +715,9 @@ static void device_worker(WorkerCtx& W) {
     char buf[65]; le256_to_hex(max_chunk, buf);
     int grid = (int)((threadsTotal + W.threads_per_block - 1) / W.threads_per_block);
     printf("config      : batch=%u keys per inversion | threads/block=%u | "
-           "jobs=%llu total threads | grid=%u blocks | sections=%d (groupSize=%llu) | backward=%s | max_batches=%u per launch%s | max_chunk=%s\n",
+           "jobs=%llu total threads | grid=%u blocks | sections=%d (groupSize=%llu%s) | backward=%s | max_batches=%u per launch%s | max_chunk=%s\n",
            W.B, W.threads_per_block, (unsigned long long)threadsTotal,
-           grid, S, (unsigned long long)groupSize, back ? "yes" : "no", max_batches,
+           grid, S, (unsigned long long)kGroupSize, W.global_stride ? ", global stride" : "", back ? "yes" : "no", max_batches,
            auto_timebox ? " (auto-timeboxed)" : "", buf);
     if (W.dev == 0) {
       printf("\n=== Harakiri Config Explained ===\n");
@@ -692,7 +747,7 @@ static void device_worker(WorkerCtx& W) {
 
     int grid = (int)((threadsTotal + W.threads_per_block - 1) / W.threads_per_block);
     kernel_point_add_and_check_oneinv<<<grid, W.threads_per_block>>>(
-        d_Px, d_Py, d_Rx, d_Ry, d_start, d_cnt, threadsTotal, groupSize, W.B, max_batches,
+        d_Px, d_Py, d_Rx, d_Ry, d_start, d_cnt, threadsTotal, kGroupSize, W.B, max_batches,
         d_found_flag, d_global_stop, d_found_result, d_hashes, d_any_left);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -812,6 +867,7 @@ int main(int argc, char** argv) {
   std::vector<int> gpu_ids;  // --gpui 0,1,2: explicit device list; empty = 0..N-1
   bool hash_test = false;   // --hashtest: run the hash gate and exit
   bool g_multibuffer = false; // --multibuffer: pair the +/- sides into one 2x hash
+  bool g_global = false;      // --global: one shared frontier across GPUs (stride = all-threads*B)
 
   // parse args
   for (int i = 1; i < argc; ++i) {
@@ -875,6 +931,7 @@ int main(int argc, char** argv) {
     else if (a == "--selftest") self_test = true;
     else if (a == "--hashtest") hash_test = true;
     else if (a == "--multibuffer") g_multibuffer = true;
+    else if (a == "--global") g_global = true;
   }
 
   // ---- hash correctness gate ----
@@ -911,7 +968,7 @@ int main(int argc, char** argv) {
   if (range_hex.empty()) {
 fprintf(stderr, "usage: harakiri_sweep [--batch B] [--threads T] [--range start_hex[:len_dec]] "
              "[--target hex160] [--iters N] [--sections N] [--backward] [--selftest] "
-             "[--multibuffer] [--hashtest]\n");
+             "[--multibuffer] [--hashtest] [--global]\n");
     return 1;
   }
 
@@ -1147,6 +1204,31 @@ workers[d].warmup_sec = warmup_sec;
   for (int s = 0; s < sections; ++s) {
     int d = (used_gpus > 1) ? (s % used_gpus) : 0;
     workers[d].sections.push_back(all_sections[s]);
+  }
+
+  // ---- --global: one shared frontier across all GPUs ----
+  // Requires one section per GPU (sections == device count), no --backward,
+  // and explicit --jobs so every worker has the same thread count known up
+  // front. Each worker keeps its section for reporting but the sweep itself
+  // uses global_start/global_len with stride global_T*B (see device_worker).
+  if (g_global) {
+    if (backward) { fprintf(stderr, "error: --global needs no --backward (single shared frontier)\n"); return 1; }
+    if (!jobs_explicit) { fprintf(stderr, "error: --global needs explicit --jobs (same thread count per GPU)\n"); return 1; }
+    if (sections != used_gpus) { fprintf(stderr, "error: --global needs --sections == device count (one slice per GPU for reporting, shared stride for sweeping)\n"); return 1; }
+    uint64_t per_w = (threadsTotal / 1) & ~0xFFull;   // G=1 per worker, same as device_worker
+    if (per_w < 256) per_w = 256;
+    uint64_t global_T = per_w * (uint64_t)used_gpus;
+    for (int d = 0; d < used_gpus; ++d) {
+      workers[d].global_stride = true;
+      workers[d].global_T = global_T;
+      workers[d].global_di = (uint64_t)d;
+      workers[d].global_D = (uint64_t)used_gpus;
+      for (int k=0;k<4;++k) { workers[d].global_start[k] = range_start[k]; workers[d].global_len[k] = range_len[k]; }
+    }
+    printf("stride      : global shared frontier, T=%llu threads x B=%u across %d GPU(s)\n",
+           (unsigned long long)global_T, B, used_gpus);
+  } else {
+    for (int d = 0; d < used_gpus; ++d) workers[d].global_stride = false;
   }
 
   // shared host-mapped stop flag + winner slot

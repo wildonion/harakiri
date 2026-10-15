@@ -369,11 +369,11 @@ __device__ __forceinline__ void hash160_33_from_x(uint8_t prefix, const uint64_t
 }
 
 // ---------------------------------------------------------------------------
-// Register-reduced variant: builds the SHA-256 message schedule W[0..8]
-// DIRECTLY from the x limbs and the RIPEMD-160 message words X[0..7] as
-// byte-swaps of the SHA words, so no msg[]/sha_bytes[] byte arrays exist ->
-// far fewer live registers and no byte-shuffling instructions in the per-key
-// hot loop.
+// Register-reduced variant: builds the SHA-256 message words W[0..15] directly
+// from the x limbs, runs a rolling 16-word schedule fused into the 64 rounds
+// (live state 16 words, not 64), and builds the RIPEMD-160 words as
+// single-instruction byte-swaps (__byte_perm) of the SHA digest. No msg[] or
+// sha_bytes[] arrays exist anywhere in the per-key path.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void hash160_33_from_x_red(uint8_t prefix, const uint64_t x_le[4], uint32_t out160[5]) {
   const uint64_t xr0 = x_le[0];
@@ -396,17 +396,10 @@ __device__ __forceinline__ void hash160_33_from_x_red(uint8_t prefix, const uint
   W[9]  = 0; W[10] = 0; W[11] = 0; W[12] = 0; W[13] = 0; W[14] = 0;
   W[15] = 0x00000108U;  // bit length 33*8 = 264
 
-  // ---- SHA-256 schedule + rounds ----
-  uint32_t wsch[64];
-  #pragma unroll
-  for (int i = 0; i < 16; ++i) wsch[i] = W[i];
-  #pragma unroll
-  for (int i = 16; i < 64; ++i) {
-    uint32_t s0 = ror32(wsch[i-15], 7) ^ ror32(wsch[i-15], 18) ^ (wsch[i-15] >> 3);
-    uint32_t s1 = ror32(wsch[i-2], 17) ^ ror32(wsch[i-2], 19) ^ (wsch[i-2] >> 10);
-    wsch[i] = wsch[i-16] + s0 + wsch[i-7] + s1;
-  }
-
+  // ---- SHA-256 schedule + rounds, rolling 16-word window ----
+  // Slot i&15 holds W[i-16] (16 steps old), exactly the slot the recurrence
+  // overwrites; W[i-15]/W[i-2]/W[i-7] live at (i+1)&15, (i+14)&15, (i+9)&15.
+  // Live state is 16 words, not 64 (same pattern as the gated 2x variant).
   uint32_t h0 = 0x6a09e667U, h1 = 0xbb67ae85U, h2 = 0x3c6ef372U, h3 = 0xa54ff53aU;
   uint32_t h4 = 0x510e527fU, h5 = 0x9b05688cU, h6 = 0x1f83d9abU, h7 = 0x5be0cd19U;
   uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
@@ -424,9 +417,16 @@ __device__ __forceinline__ void hash160_33_from_x_red(uint8_t prefix, const uint
 
   #pragma unroll
   for (int i = 0; i < 64; ++i) {
+    if (i >= 16) {
+      uint32_t p15 = W[(i+1)&15], p2 = W[(i+14)&15], p7 = W[(i+9)&15];
+      uint32_t s0 = ror32(p15, 7) ^ ror32(p15, 18) ^ (p15 >> 3);
+      uint32_t s1 = ror32(p2, 17) ^ ror32(p2, 19) ^ (p2 >> 10);
+      W[i&15] += s0 + p7 + s1;
+    }
+    uint32_t wi = W[i&15];
     uint32_t S1 = ror32(e, 6) ^ ror32(e, 11) ^ ror32(e, 25);
     uint32_t ch = (e & f) ^ (~e & g);
-    uint32_t t1 = hh + S1 + ch + K[i] + wsch[i];
+    uint32_t t1 = hh + S1 + ch + K[i] + wi;
     uint32_t S0 = ror32(a, 2) ^ ror32(a, 13) ^ ror32(a, 22);
     uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
     uint32_t t2 = S0 + maj;
@@ -437,22 +437,12 @@ __device__ __forceinline__ void hash160_33_from_x_red(uint8_t prefix, const uint
   h4 += e; h5 += f; h6 += g; h7 += hh;
 
   // ---- RIPEMD-160 message words: X[i<8] = byte-swap of SHA word (LE) ----
+  // __byte_perm(v,0,0x0123) is a single-instruction bswap32 (KeyHunt idiom).
   uint32_t X[16];
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    uint32_t v;
-    switch (i) {
-      case 0: v = h0; break;
-      case 1: v = h1; break;
-      case 2: v = h2; break;
-      case 3: v = h3; break;
-      case 4: v = h4; break;
-      case 5: v = h5; break;
-      case 6: v = h6; break;
-      default: v = h7; break;
-    }
-    X[i] = ((v & 0x000000FFU) << 24) | ((v & 0x0000FF00U) << 8) |
-           ((v & 0x00FF0000U) >> 8)  | ((v & 0xFF000000U) >> 24);
+  {
+    uint32_t hv[8] = {h0, h1, h2, h3, h4, h5, h6, h7};
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) X[i] = __byte_perm(hv[i], 0, 0x0123);
   }
   X[8]  = 0x00000080U;   // pad byte
   X[9]  = 0; X[10] = 0; X[11] = 0; X[12] = 0; X[13] = 0;
