@@ -110,7 +110,8 @@ __global__ void kernel_point_add_and_check_oneinv(
     uint64_t* __restrict__ start_scalars,
     uint64_t* __restrict__ counts256,
     uint64_t threadsTotal,
-    uint64_t groupSize,          // threads per section-group (stride = groupSize*B)
+    uint64_t groupSize,          // threads per section-group (indexes c_Jx/c_dir)
+    uint64_t strideThreads,      // scalar advance per batch = strideThreads*B keys
     uint32_t batch_size,
     uint32_t max_batches_per_launch,
     int* __restrict__ d_found_flag,
@@ -131,7 +132,12 @@ __global__ void kernel_point_add_and_check_oneinv(
     // groupSize threads each; group gid/groupSize owns a contiguous slice of
     // the range and strides by groupSize*B within it. c_Jx[g]/c_Jy[g] holds
     // that group's (groupSize*B)*G advance point.
-    const uint64_t stride = groupSize * (uint64_t)B;
+    //
+    // strideThreads is normally == groupSize (shared-frontier layout). With
+    // --chunks each thread owns a contiguous block and marches it alone, so
+    // the host passes strideThreads = 1 (one batch = B keys per step) while
+    // keeping groupSize = threadsTotal so every thread indexes c_Jx[0].
+    const uint64_t stride = strideThreads * (uint64_t)B;
 
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= threadsTotal) return;

@@ -274,6 +274,27 @@ static void add256(uint64_t a[4], const uint64_t b[4]) {
   }
 }
 
+// r = a * m  (256-bit a, 64-bit m; overflow beyond 256 bits is dropped)
+// Portable 32-bit limb multiply so it builds on MSVC and gcc alike.
+static void mul256_u64(uint64_t r[4], const uint64_t a[4], uint64_t m) {
+  uint64_t carry = 0;
+  const uint64_t m0 = m & 0xFFFFFFFFull, m1 = m >> 32;
+  for (int i = 0; i < 4; ++i) {
+    const uint64_t a0 = a[i] & 0xFFFFFFFFull, a1 = a[i] >> 32;
+    const uint64_t p0 = a0 * m0;
+    const uint64_t p1 = a0 * m1;
+    const uint64_t p2 = a1 * m0;
+    const uint64_t p3 = a1 * m1;
+    const uint64_t mid = (p0 >> 32) + (p1 & 0xFFFFFFFFull) + (p2 & 0xFFFFFFFFull);
+    const uint64_t lo = (p0 & 0xFFFFFFFFull) | (mid << 32);
+    const uint64_t hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+    const uint64_t lo2 = lo + carry;
+    const uint64_t c = (lo2 < lo) ? 1ull : 0ull;
+    r[i] = lo2;
+    carry = hi + c;
+  }
+}
+
 #if defined(_MSC_VER) && defined(_M_X64)
 #include <intrin.h>
 #endif
@@ -385,6 +406,11 @@ struct WorkerCtx {
   // di, di+D, di+2D, ... (D = device count). Kernel is unchanged: it is
   // launched with groupSize = global_T so stride falls out as global_T*B.
   bool global_stride;
+  // --chunks: KeyHunt-style layout. Each GPU gets one contiguous slice and
+  // each thread owns one contiguous block of that slice, marching it alone
+  // (stride = B keys). Same expected find time as --global, different
+  // realisation: find depth becomes (key - slice_start) / block_size.
+  bool chunks;
   uint64_t global_T;                      // total threads across all workers
   uint64_t global_di;                     // this worker's index 0..D-1
   uint64_t global_D;                      // number of workers sharing the frontier
@@ -436,12 +462,22 @@ static void device_worker(WorkerCtx& W) {
   // (0..threadsTotal-1) all map to group 0; the device offset is encoded in
   // each thread's start scalar below (gid*D+di) and in the shared J point.
   uint64_t kGroupSize = groupSize;
+  uint64_t kStrideThreads = groupSize;   // kernel scalar stride = kStrideThreads*B
   uint64_t g_chunk[4] = {0,0,0,0};   // valid only when global_stride
   uint64_t g_end[4] = {0,0,0,0};
+  if (W.chunks) {
+    if (back || S != 1) { fprintf(stderr, "[GPU %d][FATAL] --chunks needs 1 forward section per GPU\n", W.dev); exit(1); }
+    // Each thread owns a contiguous block and marches it alone: one batch (B
+    // keys) per step. groupSize = threadsTotal keeps every thread in group 0
+    // so all of them share c_Jx[0] (= B*G). See the start/count loop below.
+    kGroupSize = threadsTotal;
+    kStrideThreads = 1;
+  }
   if (W.global_stride) {
     if (back || S != 1) { fprintf(stderr, "[GPU %d][FATAL] --global needs 1 forward section per GPU\n", W.dev); exit(1); }
     if (W.global_T < threadsTotal) { fprintf(stderr, "[GPU %d][FATAL] global_T < local threads\n", W.dev); exit(1); }
     kGroupSize = W.global_T;
+    kStrideThreads = W.global_T;     // frontier width == group size (must match!)
     // chunk = ceil(global_len / global_T), rounded up to a B multiple
     uint64_t q[4], r;
     div256_u64(W.global_len, W.global_T, q, &r);
@@ -452,6 +488,27 @@ static void device_worker(WorkerCtx& W) {
     for (int k=0;k<4;++k) g_chunk[k] = q[k];
     for (int k=0;k<4;++k) g_end[k] = W.global_start[k];
     add256(g_end, W.global_len);
+    // Safety net: the batched span must still cover the whole range. Catches
+    // any future divergence between the scalar stride and the frontier.
+    uint64_t rounds[4], span[4], t2[4];
+    div256_u64(g_chunk, (uint64_t)W.B, rounds, &rm);
+    mul256_u64(t2, rounds, kStrideThreads);
+    mul256_u64(span, t2, (uint64_t)W.B);
+    if (!ge256(span, W.global_len)) {
+      fprintf(stderr, "[GPU %d][FATAL] --global layout covers only a fraction of the "
+                      "range (stride=%llu*B, need %llu*B); refusing to run\n",
+              W.dev, (unsigned long long)kStrideThreads, (unsigned long long)W.global_T);
+      exit(1);
+    }
+  }
+  // Any non-chunks layout strides by exactly one group width. --chunks is the
+  // only mode where the stride (B) is deliberately narrower than groupSize
+  // (threadsTotal), because each thread owns its own block.
+  if (!W.chunks && kStrideThreads != kGroupSize) {
+    fprintf(stderr, "[GPU %d][FATAL] stride/group mismatch (%llu vs %llu); "
+                    "the kernel would walk the wrong span\n",
+            W.dev, (unsigned long long)kStrideThreads, (unsigned long long)kGroupSize);
+    exit(1);
   }
 
   // ---- constants + table generation (constant memory is per-device) ----
@@ -536,6 +593,17 @@ static void device_worker(WorkerCtx& W) {
     if ((grp_chunk[0]|grp_chunk[1]|grp_chunk[2]|grp_chunk[3]) == 0)
       add256_u64(&grp_chunk[0], (uint64_t)W.B);
   }
+  // --chunks: per-thread count is ceil(floor(len/T)/B)*B (see the start/count
+  // loop); use it for max_chunk / max_batches / reporting.
+  if (W.chunks) {
+    uint64_t stride[4], rr, q[4], r2, span[4];
+    div256_u64(W.sections[0].len, threadsTotal, stride, &rr);
+    for (int k=0;k<4;++k) span[k] = stride[k];
+    add256_u64(span, rr);                    // last thread: stride + tail
+    div256_u64(span, (uint64_t)W.B, q, &r2);
+    if (r2) add256_u64(q, 1);
+    mul256_u64(&grp_chunk[0], q, (uint64_t)W.B);
+  }
 
   if ((threadsTotal & (W.threads_per_block - 1)) != 0)
     fprintf(stderr, "warning: jobs=%llu is not a multiple of threads/block=%u; "
@@ -547,6 +615,7 @@ static void device_worker(WorkerCtx& W) {
   // forward thread : S0 = A + local*B + half   (march up)
   // backward thread: S0 = A+len - local*B - half (march down; A+len = section end)
   // --global      : S0 = GSTART + (gid*D+di)*B + half (shared frontier interleave)
+  // --chunks      : S0 = A + gid*chunk + half, count = chunk (one block per thread)
   std::vector<uint64_t> h_start(threadsTotal*4), h_cnt(threadsTotal*4);
   for (uint64_t gid = 0; gid < threadsTotal; ++gid) {
     uint64_t group = gid / kGroupSize;
@@ -561,6 +630,37 @@ static void device_worker(WorkerCtx& W) {
       inc256(S0, (uint64_t)(W.B / 2));
       bool past_end = ge256(bstart, g_end);
       for (int k=0;k<4;++k) { h_start[gid*4+k] = S0[k]; h_cnt[gid*4+k] = past_end ? 0 : g_chunk[k]; }
+      continue;
+    }
+    if (W.chunks) {
+      // KeyHunt stride: block g starts at A + g*floor(len/T) -- EXACT, not
+      // rounded -- so the block boundaries match KeyHunt bit-for-bit. Its
+      // length is rounded UP to a whole batch, so adjacent blocks overlap by
+      // < B keys instead of leaving a gap (KeyHunt silently drops that tail).
+      // The last block also gets the range remainder, keeping coverage at 100%.
+      const SectionRange& sec = W.sections[0];
+      uint64_t stride[4], rr;
+      div256_u64(sec.len, threadsTotal, stride, &rr);
+      uint64_t lo[4], hi[4];
+      mul256_u64(lo, stride, gid);             // lo  = gid*stride
+      mul256_u64(hi, stride, gid + 1);         // hi  = (gid+1)*stride
+      uint64_t cnt[4] = {0,0,0,0};
+      if (!ge256(lo, sec.len)) {
+        // the last thread absorbs len - T*stride so the range tail is covered
+        if (gid + 1 >= threadsTotal || ge256(hi, sec.len))
+          for (int k=0;k<4;++k) hi[k] = sec.len[k];
+        uint64_t span[4];
+        sub256(hi, lo, span);
+        uint64_t q[4], r2;
+        div256_u64(span, (uint64_t)W.B, q, &r2);
+        if (r2) add256_u64(q, 1);
+        mul256_u64(cnt, q, (uint64_t)W.B);
+      }
+      uint64_t S0[4];
+      for (int k=0;k<4;++k) S0[k] = lo[k];
+      add256(S0, sec.start);
+      inc256(S0, (uint64_t)(W.B / 2));         // first batch covers [lo, lo+B)
+      for (int k=0;k<4;++k) { h_start[gid*4+k] = S0[k]; h_cnt[gid*4+k] = cnt[k]; }
       continue;
     }
     int s = grp_sec[(int)group];
@@ -589,8 +689,10 @@ static void device_worker(WorkerCtx& W) {
   // The J magnitude is the same for every group: (groupSize*B)*G. Forward groups
   // upload +J; backward groups upload -J = (Jx, p-Jy) so the identical point-add
   // in the kernel advances the base point DOWNWARD.
+  // --chunks uses kStrideThreads = 1 (J = B*G) so each thread marches its block
+  // one batch at a time while still indexing c_Jx[0].
   {
-    uint64_t jsc[4] = {kGroupSize * (uint64_t)W.B, 0, 0, 0}, Jx[4], Jy[4];
+    uint64_t jsc[4] = {kStrideThreads * (uint64_t)W.B, 0, 0, 0}, Jx[4], Jy[4];
     scalar_mul_g(jsc, Jx, Jy);
     const uint64_t P_LE[4] = {0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
                               0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL};
@@ -717,7 +819,9 @@ static void device_worker(WorkerCtx& W) {
     printf("config      : batch=%u keys per inversion | threads/block=%u | "
            "jobs=%llu total threads | grid=%u blocks | sections=%d (groupSize=%llu%s) | backward=%s | max_batches=%u per launch%s | max_chunk=%s\n",
            W.B, W.threads_per_block, (unsigned long long)threadsTotal,
-           grid, S, (unsigned long long)kGroupSize, W.global_stride ? ", global stride" : "", back ? "yes" : "no", max_batches,
+           grid, S, (unsigned long long)kGroupSize,
+           W.global_stride ? ", global stride" : (W.chunks ? ", block chunks" : ""),
+           back ? "yes" : "no", max_batches,
            auto_timebox ? " (auto-timeboxed)" : "", buf);
     if (W.dev == 0) {
       printf("\n=== Harakiri Config Explained ===\n");
@@ -747,7 +851,7 @@ static void device_worker(WorkerCtx& W) {
 
     int grid = (int)((threadsTotal + W.threads_per_block - 1) / W.threads_per_block);
     kernel_point_add_and_check_oneinv<<<grid, W.threads_per_block>>>(
-        d_Px, d_Py, d_Rx, d_Ry, d_start, d_cnt, threadsTotal, kGroupSize, W.B, max_batches,
+        d_Px, d_Py, d_Rx, d_Ry, d_start, d_cnt, threadsTotal, kGroupSize, kStrideThreads, W.B, max_batches,
         d_found_flag, d_global_stop, d_found_result, d_hashes, d_any_left);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -868,6 +972,7 @@ int main(int argc, char** argv) {
   bool hash_test = false;   // --hashtest: run the hash gate and exit
   bool g_multibuffer = false; // --multibuffer: pair the +/- sides into one 2x hash
   bool g_global = false;      // --global: one shared frontier across GPUs (stride = all-threads*B)
+  bool g_chunks = false;      // --chunks: KeyHunt layout, one contiguous block per thread
 
   // parse args
   for (int i = 1; i < argc; ++i) {
@@ -932,6 +1037,7 @@ int main(int argc, char** argv) {
     else if (a == "--hashtest") hash_test = true;
     else if (a == "--multibuffer") g_multibuffer = true;
     else if (a == "--global") g_global = true;
+    else if (a == "--chunks") g_chunks = true;
   }
 
   // ---- hash correctness gate ----
@@ -968,7 +1074,7 @@ int main(int argc, char** argv) {
   if (range_hex.empty()) {
 fprintf(stderr, "usage: harakiri_sweep [--batch B] [--threads T] [--range start_hex[:len_dec]] "
              "[--target hex160] [--iters N] [--sections N] [--backward] [--selftest] "
-             "[--multibuffer] [--hashtest] [--global]\n");
+             "[--multibuffer] [--hashtest] [--global|--chunks]\n");
     return 1;
   }
 
@@ -1198,6 +1304,7 @@ if (sections < 1) { fprintf(stderr, "--sections must be >= 1\n"); return 1; }
 workers[d].warmup_sec = warmup_sec;
     workers[d].backward = backward;
   workers[d].multibuffer = g_multibuffer;
+    workers[d].chunks = g_chunks;
     workers[d].range_is_infinite = range_is_infinite;
     for (int k=0;k<4;++k) workers[d].full_range_len[k] = range_len[k];
   }
@@ -1229,6 +1336,31 @@ workers[d].warmup_sec = warmup_sec;
            (unsigned long long)global_T, B, used_gpus);
   } else {
     for (int d = 0; d < used_gpus; ++d) workers[d].global_stride = false;
+  }
+
+  // ---- --chunks: one contiguous block per thread (KeyHunt-style layout) ----
+  // Each GPU owns one contiguous slice of the range (sections == device count)
+  // and inside it every thread owns a contiguous block of ~slice/jobs keys,
+  // marching it alone (stride = B per batch). Same expected find time as
+  // --global for a work-conserving order, but the depth at which a key is
+  // found depends on (key - slice_start) / block_size instead of its global
+  // position.
+  if (g_chunks) {
+    if (g_global) { fprintf(stderr, "error: --chunks and --global are mutually exclusive\n"); return 1; }
+    if (backward) { fprintf(stderr, "error: --chunks needs no --backward (blocks march forward)\n"); return 1; }
+    if (!jobs_explicit) { fprintf(stderr, "error: --chunks needs explicit --jobs (same thread count per GPU)\n"); return 1; }
+    if (sections != used_gpus) { fprintf(stderr, "error: --chunks needs --sections == device count (one slice per GPU)\n"); return 1; }
+    if (range_is_infinite) { fprintf(stderr, "error: --chunks needs a finite range (START:END or START:+COUNT)\n"); return 1; }
+    for (int d = 0; d < used_gpus; ++d) {
+      uint64_t q[4], rr;
+      div256_u64(workers[d].sections[0].len, threadsTotal, q, &rr);
+      if ((q[0]|q[1]|q[2]|q[3]) == 0) {
+        fprintf(stderr, "error: --chunks needs range/(jobs*GPUs) >= batch (%u); use fewer --jobs\n", B);
+        return 1;
+      }
+    }
+    printf("stride      : per-thread contiguous blocks, %d GPU slice(s) x jobs threads x B=%u\n",
+           used_gpus, B);
   }
 
   // shared host-mapped stop flag + winner slot

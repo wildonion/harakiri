@@ -164,6 +164,7 @@ Length = `E - S + 1` (end inclusive).
 | `--warmup N`     | 0       | Run N seconds of GPU burn-in before the sweep (see below). |
 | `--sections N`   | 1       | Split the range into N parallel sections (see below).   |
 | `--global`       | off     | One shared frontier across all GPUs (see below). Needs explicit `--jobs`, `--sections` == device count, no `--backward`. |
+| `--chunks`       | off     | KeyHunt-style layout: one contiguous block per thread, one slice per GPU (see below). Needs explicit `--jobs`, `--sections` == device count, no `--backward`, not with `--global`. |
 | `--backward`     | off     | Two-front race: forward half + backward half per section (see below). |
 | `--verbose`      | off     | Per-launch progress lines.                              |
 | `--selftest`     | off     | Verify engine on a random scalar inside the range.      |
@@ -224,6 +225,58 @@ Measured on 3× RTX 5090, 41-bit target `1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E`:
 | KeyHunt-CUDA | ~18 s | 20465 Mkeys/s | 375B (34.1%) |
 
 Same scalar `0x153869acc5b`, `MATCH : YES` in all runs.
+
+### Per-thread block layout (`--chunks`)
+
+`--global` is a *shared frontier*: every GPU advances the same position and the
+find depth equals the key's share of the full range. `--chunks` reproduces
+KeyHunt-CUDA's layout instead: each GPU owns one contiguous slice, and inside
+that slice **each thread owns one contiguous block** of `slice/jobs` keys and
+marches it alone (`stride = B` per batch instead of `jobs·B`).
+
+```
+harakiri_sweep.exe --chunks --batch 1024 --jobs 87040 --range 4000000000000:7ffffffffffff --target 1Npn… --maxbatch 200 --out found.txt --sections 3 --gpui 0,1,2
+```
+
+Requirements are the same as `--global` (explicit `--jobs`, `--sections` equal
+to the device count, no `--backward`; the two modes are mutually exclusive).
+The kernel is unchanged in behaviour for the other modes: it now takes a
+`strideThreads` argument, and `--chunks` passes `strideThreads = 1` with all
+threads in group 0 (`c_Jx[0] = B·G`).
+
+Expected find time is **identical** to `--global` for any work-conserving
+order (both are 50 % of a full sweep on average); only the realisation differs.
+A key at offset `d` inside a block of size `C` is found after `d/C` of that
+block, exactly like KeyHunt's `C:` counter — it is not the key's global depth.
+Which mode is "lucky" for a given key is pure chance; use `--global` when you
+want progress percentage to mean range depth, `--chunks` when you want to
+reproduce KeyHunt's numbers on the same key.
+
+Block `g` starts at exactly `A + g*floor(slice/jobs)` — the same unrounded
+stride KeyHunt uses — so `--jobs` controls the layout exactly as KeyHunt's
+`nbThread` does. Each thread scans `ceil(stride/B)*B` keys (the last one also
+absorbs the `len % jobs` tail), so adjacent blocks overlap by `< B` keys
+instead of leaving a gap — KeyHunt silently drops that tail. KeyHunt-CUDA runs
+262144 threads per GPU:
+
+```
+--chunks --jobs 262144 --sections 3 --gpui 0,1,2   # block = slice/262144 = 11,184,810 keys
+```
+
+Threads beyond the resident limit queue as extra block waves (same as KeyHunt).
+On the 3050 that costs ~2 % at 4× residency (472.8 → 464.4 Mkeys/s), but on
+3× RTX 5090 the 1024-block grid is 3.01 waves of 340, so the 4-block tail wave
+costs ~10 % (26.3 → 23.8 Gkeys/s). Use a multiple of the resident block count
+if you care about the last few percent — but see the warning below: the layout
+matters more than the wave tail.
+
+> **The layout is a lottery, not a speed-up.** For a fixed target every
+> work-conserving order has the same expected find time (50 % of a full sweep);
+> only the realisation changes. The 44-bit test key sits at 76 % of the range
+> globally, 32.6 % of its block with `--jobs 87040` and 3.25 % with
+> `--jobs 262144` — the same key, the same tool, 109 s vs 12 s. KeyHunt's
+> 14 s find was that 3.25 % draw, not a faster engine. Do not tune `--jobs`
+> for one key: pick the layout once and expect 50 %.
 
 ### Two-front race (`--backward`)
 
