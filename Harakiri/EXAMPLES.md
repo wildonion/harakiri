@@ -1,5 +1,13 @@
 
 
+# GPU realtime monitoring 
+
+```powershell
+vidia-smi -i 0,1,2 -pl 489 # limit the power 
+nvidia-smi --query-gpu=timestamp,index,name,temperature.gpu,power.draw,power.limit,clocks.sm,clocks.mem,utilization.gpu,utilization.memory,memory.used,pcie.link.gen.current,pcie.link.width.current,clocks_throttle_reasons.active --format=csv -l 5 -f gpu_monitor.csv
+nvidia-smi dmon -s pucvmet -d 2 -o DT -f gpu_dmon.csv
+```
+
 ## 41 bits key output:
 
 ```powershell
