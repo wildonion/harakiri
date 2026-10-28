@@ -115,3 +115,12 @@ searched    : 8.867e+12 / 3.518e+13 keys (25.20% of range)
 result written to found.txt
 done
 ```
+
+## 70 bits - 4 packs of 2^50 bits each example commands:
+
+```
+./harakiri_sweep.exe --chunks --batch 1024 --jobs 87040 --range 7ff800000000000000:7ff803ffffffffffff --target 1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU --maxbatch 200 --out found.txt --sections 3 --gpui 0,1,2
+./harakiri_sweep.exe --chunks --batch 1024 --jobs 87040 --range 7ff804000000000000:7ff807ffffffffffff --target 1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU --maxbatch 200 --out found.txt --sections 3 --gpui 0,1,2
+./harakiri_sweep.exe --chunks --batch 1024 --jobs 87040 --range 7ff808000000000000:7ff80bffffffffffff --target 1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU --maxbatch 200 --out found.txt --sections 3 --gpui 0,1,2
+./harakiri_sweep.exe --chunks --batch 1024 --jobs 87040 --range 7ff80c000000000000:7ff80fffffffffffff --target 1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU --maxbatch 200 --out found.txt --sections 3 --gpui 0,1,2
+```
