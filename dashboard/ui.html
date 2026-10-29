@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harakiri dashboard</title>
+<link rel="stylesheet" href="/ui.css">
+</head>
+<body>
+<header>
+  <div class="brand">HARAKIRI <span class="sub">sweep dashboard</span></div>
+  <div class="status">
+    <span id="pill" class="pill idle">idle</span>
+    <span id="elapsed" class="mono muted">—</span>
+    <span id="rate" class="mono muted"></span>
+    <span id="gpuCount" class="mono muted"></span>
+    <span id="foundBadge" class="badge hidden">FOUND</span>
+  </div>
+</header>
+
+<main>
+  <div id="errBar" class="errbar hidden"></div>
+
+  <section class="card">
+    <div class="row between">
+      <h2>Run</h2>
+      <span class="hint" id="exeHint"></span>
+    </div>
+    <form id="runForm" class="form" autocomplete="off">
+      <label>mode
+        <select id="mode">
+          <option value="global">global (shared frontier)</option>
+          <option value="chunks">chunks (per-thread blocks)</option>
+          <option value="sections">sections (default)</option>
+          <option value="backward">backward (two fronts)</option>
+        </select>
+      </label>
+      <label>range
+        <input id="range" type="text" placeholder="200000000000:3fffffffffff" spellcheck="false">
+      </label>
+      <label>target
+        <input id="target" type="text" placeholder="address or hash160" spellcheck="false">
+      </label>
+      <label>batch
+        <input id="batch" type="number" min="1" value="1024">
+      </label>
+      <label>jobs
+        <input id="jobs" type="number" min="1" value="87040">
+      </label>
+      <label>sections
+        <input id="sections" type="number" min="1" value="3">
+      </label>
+      <label>gpui
+        <input id="gpui" type="text" value="0,1,2" spellcheck="false">
+      </label>
+      <label>maxbatch
+        <input id="maxbatch" type="number" min="1" value="200">
+      </label>
+      <label>out
+        <input id="out" type="text" value="found.txt" spellcheck="false">
+      </label>
+      <label class="wide">extra args
+        <input id="extra" type="text" placeholder="--verbose --multibuffer" spellcheck="false">
+      </label>
+      <div class="actions">
+        <button id="startBtn" type="submit" class="primary">Start</button>
+        <button id="stopBtn" type="button" class="danger">Stop</button>
+      </div>
+    </form>
+    <div id="runMsg" class="msg"></div>
+    <div id="cmdLine" class="cmd mono"></div>
+  </section>
+
+  <section class="card">
+    <div class="row between wrap">
+      <h2>All GPUs</h2>
+      <div class="row">
+        <div class="tabs" id="metricTabs">
+          <button data-metric="power" class="tab active">power</button>
+          <button data-metric="temp" class="tab">temp</button>
+          <button data-metric="util" class="tab">util</button>
+          <button data-metric="clocks" class="tab">clocks</button>
+          <button data-metric="mem" class="tab">mem</button>
+        </div>
+        <select id="windowSel" class="mini">
+          <option value="60">1 min</option>
+          <option value="300" selected>5 min</option>
+          <option value="900">15 min</option>
+          <option value="1800">30 min</option>
+        </select>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="combined"></canvas></div>
+    <div id="legend" class="legend"></div>
+  </section>
+
+  <section id="gpuGrid" class="gpu-grid"></section>
+
+  <section class="card">
+    <div class="row between wrap">
+      <h2>Power limit</h2>
+      <div class="row">
+        <input id="allW" type="number" min="50" max="1500" value="489" class="mini" title="watts">
+        <button id="fillPower" type="button" class="ghost">fill all</button>
+      </div>
+    </div>
+    <div id="powerRows" class="power-rows"><span class="muted">waiting for GPU data…</span></div>
+    <div class="row">
+      <button id="applyPower" type="button">Apply limits</button>
+      <span class="hint">needs an elevated (Administrator) shell on Windows</span>
+    </div>
+    <div id="powerMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <div class="row between">
+      <h2>Log</h2>
+      <label class="small"><input type="checkbox" id="autoscroll" checked> autoscroll</label>
+    </div>
+    <pre id="log" class="log"></pre>
+  </section>
+</main>
+
+<script src="/ui.js"></script>
+</body>
+</html>
