@@ -8,7 +8,7 @@ nvidia-smi --query-gpu=timestamp,index,name,temperature.gpu,power.draw,power.lim
 nvidia-smi dmon -s pucvmet -d 2 -o DT -f gpu_dmon.csv
 ```
 
-## 45 bits key output (`--global`):
+## 45 bits key output (`--global`) - 575.00 W all GPUs:
 
 ```powershell
 PS C:\Users\Administrator\Desktop\wildonion> ./harakiri_sweep.exe --global --batch 1024 --jobs 87040 --range 200000000000:3fffffffffff --target 1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP --maxbatch 200 --out found.txt --sections 3 --gpui 0,1,2
@@ -62,7 +62,7 @@ result written to found.txt
 done
 ```
 
-## 45 bits key output (`--chunks`):
+## 45 bits key output (`--chunks`) - 575.00 W all GPUs:
 
 ```powershell
 PS C:\Users\Administrator\Desktop\wildonion> ./harakiri_sweep.exe --chunks --batch 1024 --jobs 87040 --range 200000000000:3fffffffffff --target 1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP --maxbatch 200 --out found.txt --sections 3 --gpui 0,1,2
