@@ -14,6 +14,8 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <filesystem>
 
 #include "field.h"
 #include "hash.h"
@@ -384,6 +386,106 @@ static void partition_range(const uint64_t range_start[4], const uint64_t range_
   }
 }
 
+// ---- checkpoint / snapshot -------------------------------------------------
+// Every ckpt_every seconds each GPU snapshots its per-thread progress: the
+// start scalar S and remaining count rem for every launched thread. The kernel
+// keeps this state in device memory between launches (it updates d_start/d_cnt
+// in place), so the hot-path cost is ONE small D2H copy (~1 ms) per snapshot;
+// the disk write happens on a background writer thread (ping-pong pinned
+// buffers, tmp-file + atomic rename), so the launch loop never waits on I/O.
+// Restarting with --checkpoint DIR auto-resumes each GPU from its file when
+// the args match exactly; a crash loses at most one snapshot interval.
+#pragma pack(push, 1)
+struct CkptHeader {
+  char     magic[8];          // "HCKP0001"
+  uint32_t version;           // = 1
+  int32_t  dev;               // CUDA device index this file belongs to
+  uint32_t B;                 // batch size (keys per inversion)
+  uint64_t T;                 // launched threads (= number of state entries)
+  uint8_t  target[20];        // target hash160
+  uint64_t range_start[4], range_len[4];   // full requested range
+  uint64_t sec_start[4],     sec_len[4];   // this worker's section slice
+  uint32_t launches_done;     // launches completed at snapshot time
+  uint32_t complete;          // 1 = section fully exhausted, nothing left
+  uint64_t tstamp;            // unix seconds
+  double   rate_mkeys_s;      // measured throughput this run (Mkeys/s)
+  unsigned long long keys_done_section;    // keys done in this section (incl. resumed)
+};
+#pragma pack(pop)
+
+struct CkptWriter {
+  bool active = false;
+  std::string path;                       // DIR/gpu<dev>.bin
+  size_t body_sz = 0;                     // T*32*2 bytes (S array + rem array)
+  uint8_t* buf[2] = {nullptr, nullptr};   // pinned: [CkptHeader | S... | rem...]
+  int next = 0;                           // buffer the worker fills next
+  int state[2] = {0, 0};                  // 0 free | 1 queued for write | 2 writing
+  std::thread th;
+  std::mutex m;
+  std::condition_variable cv_free;        // worker: wait until a buffer is free
+  std::condition_variable cv_work;        // writer: wait for a queued buffer
+  int pending = -1;                       // buffer index waiting to be written
+  bool stop = false;
+
+  void start(int dev, const char* dir, uint64_t T) {
+    body_sz = (size_t)T * 32u * 2u;
+    path = (std::filesystem::path(dir) / ("gpu" + std::to_string(dev) + ".bin")).string();
+    for (int i = 0; i < 2; ++i)
+      CUDA_CHECK(cudaHostAlloc((void**)&buf[i], sizeof(CkptHeader) + body_sz, cudaHostAllocDefault));
+    active = true;
+    th = std::thread([this]{ writer_loop(); });
+  }
+
+  // Fill the next pinned buffer (header + D2H copies of S and rem), hand it to
+  // the writer. Blocks only if BOTH buffers are still in flight (never happens
+  // at sane intervals; a stalled disk then pauses the sweep rather than losing
+  // checkpoints).
+  void submit(const uint64_t* d_S, const uint64_t* d_rem, const CkptHeader& hdr) {
+    if (!active) return;
+    { std::unique_lock<std::mutex> lk(m);
+      cv_free.wait(lk, [this]{ return state[next] == 0; }); }
+    uint8_t* b = buf[next];
+    memcpy(b, &hdr, sizeof(CkptHeader));
+    CUDA_CHECK(cudaMemcpy(b + sizeof(CkptHeader), d_S, body_sz/2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b + sizeof(CkptHeader) + body_sz/2, d_rem, body_sz/2, cudaMemcpyDeviceToHost));
+    int mine = next; next ^= 1;
+    { std::lock_guard<std::mutex> lk(m); state[mine] = 1; pending = mine; cv_work.notify_one(); }
+  }
+
+  void finish() {
+    if (!active) return;
+    { std::lock_guard<std::mutex> lk(m); stop = true; cv_work.notify_all(); }
+    th.join();
+    for (int i = 0; i < 2; ++i) if (buf[i]) cudaFreeHost(buf[i]);
+    active = false;
+  }
+
+private:
+  void writer_loop() {
+    const size_t want = sizeof(CkptHeader) + body_sz;
+    for (;;) {
+      int idx = -1;
+      { std::unique_lock<std::mutex> lk(m);
+        cv_work.wait(lk, [this]{ return pending >= 0 || stop; });
+        if (pending < 0) { if (stop) break; continue; }
+        idx = pending; pending = -1; state[idx] = 2; }
+      // write to .tmp then atomically rename over the final file: a crash mid-
+      // write leaves the previous good checkpoint intact.
+      std::string tmp = path + ".tmp";
+      FILE* f = fopen(tmp.c_str(), "wb");
+      if (f) {
+        bool ok = (fwrite(buf[idx], 1, want, f) == want);
+        fclose(f);
+        if (ok) std::filesystem::rename(tmp, path);
+        else { fprintf(stderr, "[GPU ckpt] write failed: %s\n", tmp.c_str()); std::remove(tmp.c_str()); }
+      } else {
+        fprintf(stderr, "[GPU ckpt] cannot open %s for writing\n", tmp.c_str());
+      }
+      { std::lock_guard<std::mutex> lk(m); state[idx] = 0; cv_free.notify_all(); }
+    }
+  }
+};
+
 // ---- per-device sweep worker (one std::thread per GPU) ----
 struct WorkerCtx {
   int dev;
@@ -429,6 +531,11 @@ struct WorkerCtx {
   int launches_done;        // launches actually executed, find launch included
   int found_on_launch;      // 0-based launch that found the key, -1 if none
   bool found;
+  // checkpoint / snapshot (--checkpoint DIR):
+  std::string ckpt_dir;        // empty = disabled
+  int ckpt_every_sec;          // seconds between snapshots (default 300)
+  bool fresh;                  // --fresh: ignore existing checkpoints, start over
+  uint64_t full_range_start[4]; // whole requested range (ckpt header + validation)
 };
 
 static void device_worker(WorkerCtx& W) {
@@ -683,6 +790,66 @@ static void device_worker(WorkerCtx& W) {
     for (int k=0;k<4;++k) { h_start[gid*4+k] = S0[k]; h_cnt[gid*4+k] = grp_chunk[(int)group*4+k]; }
   }
 
+  // ---- checkpoint / snapshot: resume from file if present, start writer ----
+  CkptWriter ckpt;
+  unsigned long long resumed_keys = 0;    // keys already done before this process started
+  uint32_t resumed_launches = 0;          // launches completed in earlier processes (for reporting)
+  if (!W.ckpt_dir.empty()) {
+    if (!W.chunks) { fprintf(stderr, "[GPU %d][FATAL] --checkpoint requires --chunks\n", W.dev); exit(1); }
+    std::string cpath = (std::filesystem::path(W.ckpt_dir) / ("gpu" + std::to_string(W.dev) + ".bin")).string();
+    CkptHeader hdr{}; bool have_file = false;
+    { FILE* f = fopen(cpath.c_str(), "rb");
+      if (f) { have_file = (fread(&hdr, 1, sizeof(hdr), f) == sizeof(hdr)); fclose(f); } }
+    auto eq4 = [](const uint64_t a[4], const uint64_t b[4]) {
+      return a[0]==b[0] && a[1]==b[1] && a[2]==b[2] && a[3]==b[3]; };
+    bool valid = have_file && !memcmp(hdr.magic, "HCKP0001", 8) && hdr.version == 1
+      && (int)hdr.dev == W.dev && hdr.B == W.B && hdr.T == threadsTotal
+      && !memcmp(hdr.target, W.target_hash160, 20)
+      && eq4(hdr.range_start, W.full_range_start) && eq4(hdr.range_len, W.full_range_len)
+      && eq4(hdr.sec_start, W.sections[0].start)   && eq4(hdr.sec_len, W.sections[0].len);
+    if (have_file && !valid) {
+      fprintf(stderr, "[GPU %d][FATAL] checkpoint exists but does not match current args:\n"
+                      "         %s\n         Re-run with the same command, or add --fresh to discard it.\n",
+              W.dev, cpath.c_str());
+      exit(1);
+    }
+    if (have_file && valid) {
+      if (W.fresh) {
+        std::remove(cpath.c_str());
+        printf("[GPU %d] checkpoint: --fresh given, starting from section beginning\n", W.dev);
+      } else if (hdr.complete) {
+        printf("[GPU %d] checkpoint: section already complete (%s) - nothing to do\n", W.dev, cpath.c_str());
+        W.total_hashes = 0; W.secs = 0.0; W.iter = 0; W.launches_done = 0;
+        W.found_on_launch = -1; W.found = false;
+        return;
+      } else {
+        std::vector<uint64_t> lS(threadsTotal*4), lrem(threadsTotal*4);
+        FILE* f = fopen(cpath.c_str(), "rb");
+        if (!f || fseek(f, (long)sizeof(CkptHeader), SEEK_SET) != 0 ||
+            fread(lS.data(),   8, threadsTotal*4, f) != (size_t)threadsTotal*4 ||
+            fread(lrem.data(), 8, threadsTotal*4, f) != (size_t)threadsTotal*4) {
+          fprintf(stderr, "[GPU %d][FATAL] cannot read checkpoint body: %s\n", W.dev, cpath.c_str());
+          exit(1);
+        }
+        fclose(f);
+        // done_v = fresh layout count - remaining; then adopt the saved state.
+        for (uint64_t v = 0; v < threadsTotal; ++v) {
+          uint64_t done[4]; sub256(&h_cnt[v*4], &lrem[v*4], done);
+          resumed_keys += le256_to_double(done);
+          for (int k=0;k<4;++k) { h_start[v*4+k] = lS[v*4+k]; h_cnt[v*4+k] = lrem[v*4+k]; }
+        }
+        resumed_launches = hdr.launches_done;   // seed so the next file reports cumulative launches
+        double sec_tot = le256_to_double(W.sections[0].len);
+        printf("[GPU %d] checkpoint: resuming from %s\n"
+               "              %.3e keys already done (%.1f%% of section) | saved at launch %u, rate was %.1f Mkeys/s\n",
+               W.dev, cpath.c_str(), (double)resumed_keys,
+               sec_tot > 0 ? 100.0*(double)resumed_keys/sec_tot : 0.0,
+               hdr.launches_done, hdr.rate_mkeys_s);
+      }
+    }
+    ckpt.start(W.dev, W.ckpt_dir.c_str(), threadsTotal);
+  }
+
   // ---- per-group stride point c_Jx[g] = (kGroupSize*B)*G ----
   // --global: single shared J = (global_T*B)*G on every worker so all GPUs
   // advance the same frontier. Forward only (enforced above).
@@ -786,11 +953,33 @@ static void device_worker(WorkerCtx& W) {
   // Launches actually executed, including the one that found the key. 'iter' is
   // the 0-based loop index and is only bumped on the non-found path, so a run
   // that stops on a find would otherwise report 0 regardless of the work done.
-  int launches_done = 0;
+  // Seeded with resumed_launches so checkpoint files report cumulative launches.
+   int launches_done = (int)resumed_launches;
   int found_on_launch = -1;     // -1 = not found; else 0-based launch index
   bool stop = false;
   FoundResult h_found;
   memset(&h_found, 0, sizeof(h_found));
+  unsigned int last_any = 1;      // any_left at loop exit (final ckpt complete flag)
+  double last_ckpt_sec = 0.0;     // elapsed seconds of the previous snapshot
+
+  auto make_hdr = [&](uint32_t complete) -> CkptHeader {
+    double elc = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+    CkptHeader h{};
+    memcpy(h.magic, "HCKP0001", 8);
+    h.version = 1; h.dev = W.dev; h.B = W.B; h.T = threadsTotal;
+    memcpy(h.target, W.target_hash160, 20);
+    for (int k=0;k<4;++k) {
+      h.range_start[k] = W.full_range_start[k]; h.range_len[k] = W.full_range_len[k];
+      h.sec_start[k]   = W.sections[0].start[k]; h.sec_len[k]  = W.sections[0].len[k];
+    }
+    h.launches_done = launches_done;
+    h.complete = complete;
+    h.tstamp = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
+                 std::chrono::system_clock::now().time_since_epoch()).count();
+    h.rate_mkeys_s = (elc > 0 && total_hashes > 0) ? total_hashes / elc / 1e6 : 0.0;
+    h.keys_done_section = (unsigned long long)((double)resumed_keys + (double)total_hashes);
+    return h;
+  };
 
   // max batches per launch: use the LARGEST chunk (threads with smaller chunks
   // exit early when their rem < B; any_left only set by threads with work left)
@@ -881,6 +1070,7 @@ static void device_worker(WorkerCtx& W) {
 
     unsigned int h_any = 0;
     cudaMemcpy(&h_any, d_any_left, 4, cudaMemcpyDeviceToHost);
+    last_any = h_any;
     if (W.verbose && (iter < 3 || (iter % 1000 == 0))) {
       uint64_t dbg_cnt[4];
       cudaMemcpy(dbg_cnt, d_cnt, 32, cudaMemcpyDeviceToHost);
@@ -907,6 +1097,31 @@ static void device_worker(WorkerCtx& W) {
     cudaMemcpy(d_Py, d_Ry, threadsTotal*32, cudaMemcpyDeviceToDevice);
     ++iter;
 
+    // ---- periodic checkpoint (time-based). D2H copy ~1 ms here; the disk
+    // write runs on the writer thread, so this never blocks on I/O. ----
+    if (ckpt.active && !W.self_test) {
+      auto nowc = std::chrono::high_resolution_clock::now();
+      double elc = std::chrono::duration<double>(nowc - t0).count();
+      if (elc >= W.ckpt_every_sec && (elc - last_ckpt_sec) >= W.ckpt_every_sec) {
+        last_ckpt_sec = elc;
+        ckpt.submit(d_start, d_cnt, make_hdr(0));
+        double rate = total_hashes / elc;
+        double sec_tot = le256_to_double(W.sections[0].len);
+        double done = (double)resumed_keys + (double)total_hashes;
+        if (done > sec_tot) done = sec_tot;
+        double remk = sec_tot - done;
+        char ebuf[64];
+        if (rate <= 0) strcpy(ebuf, "?");
+        else if (remk / rate >= 86400.0*365.0) sprintf(ebuf, "%.1f years", remk/rate/(86400.0*365.0));
+        else if (remk / rate >= 86400.0)       sprintf(ebuf, "%.1f days",  remk/rate/86400.0);
+        else if (remk / rate >= 3600.0)        sprintf(ebuf, "%.1f hours", remk/rate/3600.0);
+        else if (remk / rate >= 60.0)          sprintf(ebuf, "%.1f min",   remk/rate/60.0);
+        else                                   sprintf(ebuf, "%.1f s",     remk/rate);
+        printf("[GPU %d][ckpt] t=%7.1f s | %5.2f GK/s | section %6.2f%% (%.3e/%.3e keys) | ETA %s\n",
+               W.dev, elc, rate/1e9, sec_tot > 0 ? 100.0*done/sec_tot : 0.0, done, sec_tot, ebuf);
+      }
+    }
+
     if (!W.self_test && !W.range_is_infinite && (auto_timebox || W.verbose)) {
       auto now = std::chrono::high_resolution_clock::now();
       double el = std::chrono::duration<double>(now - t0).count();
@@ -932,6 +1147,14 @@ static void device_worker(WorkerCtx& W) {
                W.dev, el, total_hashes/el/1e6, (double)total_hashes);
     }
   }
+
+  // ---- final checkpoint: marks the section complete when it ran to exhaustion ----
+  if (ckpt.active && !W.self_test) {
+    ckpt.submit(d_start, d_cnt, make_hdr(last_any == 0 ? 1u : 0u));
+    printf("[GPU %d][ckpt] final snapshot saved (%s)\n", W.dev,
+           last_any == 0 ? "section complete" : "in progress");
+  }
+  ckpt.finish();
 
   auto t1 = std::chrono::high_resolution_clock::now();
   double secs = std::chrono::duration<double>(t1 - t0).count();
@@ -973,6 +1196,9 @@ int main(int argc, char** argv) {
   bool g_multibuffer = false; // --multibuffer: pair the +/- sides into one 2x hash
   bool g_global = false;      // --global: one shared frontier across GPUs (stride = all-threads*B)
   bool g_chunks = false;      // --chunks: KeyHunt layout, one contiguous block per thread
+  std::string ckpt_dir;       // --checkpoint DIR: snapshot progress to DIR/gpu<N>.bin (auto-resume)
+  int ckpt_every_sec = 300;   // --ckpt-every SEC: seconds between snapshots (default 5 min)
+  bool fresh = false;         // --fresh: ignore existing checkpoints, start from section beginning
 
   // parse args
   for (int i = 1; i < argc; ++i) {
@@ -1004,6 +1230,9 @@ int main(int argc, char** argv) {
     else if (a == "--maxbatch" && i+1<argc) maxbatch_cap = (uint32_t)atoi(argv[++i]);
     else if (a == "--out" && i+1<argc) out_file = argv[++i];
     else if (a == "--warmup" && i+1<argc) warmup_sec = atoi(argv[++i]);
+    else if (a == "--checkpoint" && i+1<argc) ckpt_dir = argv[++i];
+    else if (a == "--ckpt-every" && i+1<argc) ckpt_every_sec = atoi(argv[++i]);
+    else if (a == "--fresh") fresh = true;
     else if (a == "--sections" && i+1<argc) sections = atoi(argv[++i]);
     else if ((a == "--gpui" || a == "--devices") && i+1<argc) {
       std::string list = argv[++i];
@@ -1307,6 +1536,10 @@ workers[d].warmup_sec = warmup_sec;
     workers[d].chunks = g_chunks;
     workers[d].range_is_infinite = range_is_infinite;
     for (int k=0;k<4;++k) workers[d].full_range_len[k] = range_len[k];
+    workers[d].ckpt_dir = ckpt_dir;
+    workers[d].ckpt_every_sec = ckpt_every_sec;
+    workers[d].fresh = fresh;
+    for (int k=0;k<4;++k) workers[d].full_range_start[k] = range_start[k];
   }
   for (int s = 0; s < sections; ++s) {
     int d = (used_gpus > 1) ? (s % used_gpus) : 0;
@@ -1361,6 +1594,12 @@ workers[d].warmup_sec = warmup_sec;
     }
     printf("stride      : per-thread contiguous blocks, %d GPU slice(s) x jobs threads x B=%u\n",
            used_gpus, B);
+    if (!ckpt_dir.empty()) {
+      std::error_code ec;
+      std::filesystem::create_directories(ckpt_dir, ec);   // ok if it already exists
+      printf("checkpoint : every %d s -> %s\\gpu<N>.bin (auto-resume on restart)\n",
+             ckpt_every_sec, ckpt_dir.c_str());
+    }
   }
 
   // shared host-mapped stop flag + winner slot
