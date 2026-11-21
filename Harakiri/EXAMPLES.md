@@ -11,7 +11,7 @@ nvidia-smi dmon -s pucvmet -d 2 -o DT -f gpu_dmon.csv
 ## 45 bits key output (`--chunks`) - 575.00 W all GPUs:
 
 ```powershell
-PS C:\Users\Administrator\Desktop\7> .\harakiri_sweep.exe --chunks --batch 1024 --jobs 87040 --range 200000000000:3fffffffffff --target 1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP --maxbatch 200 --out found.txt --sections 3 --gpui 0,1,2 --ckpt-every 30 --checkpoint C:\Users\Administrator\Desktop\7\
+PS C:\Users\Administrator\Desktop\7> .\harakiri_sweep_ckpt.exe --chunks --batch 1024 --jobs 87040 --range 200000000000:3fffffffffff --target 1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP --maxbatch 200 --out found.txt --sections 3 --gpui 0,1,2 --ckpt-every 30 --checkpoint C:\Users\Administrator\Desktop\7\
 
 === Harakiri Phase 2 sweep ===
 range start : 0000000000000000000000000000000000000000000000000000200000000000
